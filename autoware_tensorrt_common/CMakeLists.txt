@@ -21,6 +21,7 @@ endif()
 
 add_library(${PROJECT_NAME} SHARED
   src/tensorrt_common.cpp
+  src/tensorrt_common_io.cpp
   src/profiler.cpp
 )
 
