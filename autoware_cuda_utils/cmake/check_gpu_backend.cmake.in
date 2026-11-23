@@ -19,12 +19,30 @@ set(autoware_cuda_utils_USE_HIP @autoware_cuda_utils_USE_HIP@)
 
 function(autoware_cuda_utils_check_gpu_backend)
   get_property(_languages GLOBAL PROPERTY ENABLED_LANGUAGES)
-  if(autoware_cuda_utils_USE_HIP)
-    if(CUDA_FOUND OR CUDAToolkit_FOUND OR "CUDA" IN_LIST _languages)
+  if(@autoware_cuda_utils_USE_HIP@)
+    set(_found_cuda)
+    foreach(_var CUDA_FOUND CUDAToolkit_FOUND)
+      if(${_var})
+        list(APPEND _found_cuda ${_var})
+      endif()
+    endforeach()
+    if("CUDA" IN_LIST _languages)
+      list(APPEND _found_cuda "the CUDA language")
+    endif()
+    if(_found_cuda)
+      list(JOIN _found_cuda ", " _found_cuda)
+      if(AUTOWARE_CUDA_USE_HIP)
+        set(_remedy "Find the find_package(CUDA), find_package(CUDAToolkit) or "
+          "enable_language(CUDA) that runs for ${PROJECT_NAME} or one of its "
+          "dependencies, and skip it when AUTOWARE_CUDA_USE_HIP is ON.")
+      else()
+        set(_remedy "Configure ${PROJECT_NAME} with "
+          "-DAUTOWARE_CUDA_USE_HIP=ON, or rebuild autoware_cuda_utils "
+          "with CUDA.")
+      endif()
       message(FATAL_ERROR
         "autoware_cuda_utils was built with HIP, but ${PROJECT_NAME} is "
-        "configured for CUDA. Configure ${PROJECT_NAME} with "
-        "-DAUTOWARE_CUDA_USE_HIP=ON, or rebuild autoware_cuda_utils with CUDA.")
+        "configured for CUDA (${_found_cuda}). " ${_remedy})
     endif()
   elseif(AUTOWARE_CUDA_USE_HIP OR "HIP" IN_LIST _languages)
     message(FATAL_ERROR
