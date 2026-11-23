@@ -31,7 +31,7 @@ struct StreamDeleter
   void operator()(cudaStream_t * stream)
   {
     if (stream) {
-      cudaStreamDestroy(*stream);
+      (void)cudaStreamDestroy(*stream);
       delete stream;
     }
   }
