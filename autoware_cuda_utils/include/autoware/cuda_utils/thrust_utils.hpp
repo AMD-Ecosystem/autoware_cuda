@@ -26,7 +26,11 @@ namespace autoware::cuda_utils
 
 [[nodiscard]] inline auto thrust_on_stream(cudaStream_t stream)
 {
+#if defined(THRUST_DEVICE_SYSTEM_HIP) && THRUST_DEVICE_SYSTEM == THRUST_DEVICE_SYSTEM_HIP
+  return thrust::hip::par.on(stream);
+#else
   return thrust::cuda::par.on(stream);
+#endif
 }
 
 namespace thrust_stream
