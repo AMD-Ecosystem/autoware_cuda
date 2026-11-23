@@ -463,6 +463,17 @@ private:
    */
   bool validateProfileDims();
 
+#ifdef AUTOWARE_TENSORRT_COMMON_MIGRAPHX
+  friend class TrtConvCalib;
+
+  struct MigraphxState;
+
+  //! @brief MIGraphX model, compiled programs and tensor bindings.
+  std::unique_ptr<MigraphxState> migraphx_;
+
+  //! @brief INT8 calibrator set by TrtConvCalib, which owns it.
+  nvinfer1::IInt8Calibrator * int8_calibrator_{nullptr};
+#else
   //! @brief TensorRT runtime.
   TrtUniquePtr<nvinfer1::IRuntime> runtime_;
 
@@ -483,6 +494,7 @@ private:
 
   //! @brief TensorRT network definition.
   std::shared_ptr<nvinfer1::INetworkDefinition> network_;
+#endif
 
   //! @brief TrtCommon library base configuration.
   std::shared_ptr<TrtCommonConfig> trt_config_;

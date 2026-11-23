@@ -80,6 +80,16 @@ public:
     calibrator_ = std::move(calibrator);
     calib_config_ = std::make_unique<const CalibrationConfig>(calib_config);
 
+#ifdef AUTOWARE_TENSORRT_COMMON_MIGRAPHX
+    // MIGraphX calibrates int8 from the calibrator's batches alone and has no layers to adjust.
+    int8_calibrator_ = calibrator_.get();
+    if (getPrecision() == "int8") {
+      getLogger()->log(
+        nvinfer1::ILogger::Severity::kWARNING,
+        "MIGraphX ignores the per-layer quantization settings (first and last layer precision, "
+        "clip value, input dynamic range) and the calibration cache");
+    }
+#else
     auto builder_config = getBuilderConfig();
     builder_config->setFlag(nvinfer1::BuilderFlag::kPREFER_PRECISION_CONSTRAINTS);
     builder_config->setInt8Calibrator(calibrator_.get());
@@ -88,11 +98,13 @@ public:
     auto logger = getLogger();
     auto quantization_log = quantization();
     logger->log(nvinfer1::ILogger::Severity::kINFO, quantization_log.c_str());
+#endif
 
     return setup(std::move(profile_dims), std::move(network_io));
   }
 
 private:
+#ifndef AUTOWARE_TENSORRT_COMMON_MIGRAPHX
   /**
    * @brief Implicit quantization for TensorRT.
    *
@@ -226,6 +238,7 @@ private:
 
     return ss.str();
   };
+#endif
 
 private:
   //!< Calibration configuration

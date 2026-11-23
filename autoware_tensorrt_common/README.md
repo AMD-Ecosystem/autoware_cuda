@@ -68,3 +68,21 @@ return success;
 auto success = trt_common_->enqueueV3(stream_);
 return success;
 ```
+
+## AMD GPUs (ROCm)
+
+When CUDA is not found, the package builds against [MIGraphX](https://github.com/ROCm/AMDMIGraphX) on ROCm instead, with the same classes and headers. The ROCm build puts `NvInfer.h`, `NvInferRuntime.h` and `NvOnnxParser.h` headers on the include path of every package that links `autoware_tensorrt_common`; they declare only the TensorRT types this API uses (`nvinfer1::Dims`, `DataType`, `TensorIOMode`, the logger, profiler and INT8 calibrator interfaces), so code written against `TrtCommon` compiles unchanged.
+
+```bash
+colcon build --packages-up-to autoware_tensorrt_common \
+  --cmake-args -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_HIP_ARCHITECTURES=gfx942
+```
+
+Pass `-DAUTOWARE_CUDA_USE_HIP=ON` to build with MIGraphX on a machine that also has CUDA, and to every package that links `autoware_tensorrt_common` there. The installed package sets `autoware_tensorrt_common_USE_HIP` to the backend it was built with, and stops the configuration of a package that links it with the other one. ROCm or MIGraphX installed outside `/opt/rocm` needs its prefix in `CMAKE_PREFIX_PATH`.
+
+What differs from TensorRT:
+
+- The compiled program is cached next to the engine path as `<engine name>.<gfx target>.<precision>.mxr`, with a `.mxr.key` file recording the MIGraphX version, GPU and precision; a program built by another MIGraphX, GPU, precision or optimization profile is rebuilt. The `.engine` file itself is not written.
+- Dynamic shapes: `setup()` compiles for the `opt` dimensions of each optimization profile, and `enqueueV3()` compiles once more for every other input shape it meets (within the profile), which takes as long as the first build.
+- `fp16` quantizes the model with MIGraphX. `int8` with `TrtConvCalib` calibrates from the batches of the given calibrator and runs only at the shapes `setup()` compiled; the per-layer settings of `CalibrationConfig` and TensorRT calibration caches are not used.
+- `getNetwork()` and `getBuilderConfig()` return null, per-layer profiling reports nothing, and DLA (`dla_core_id`) and TensorRT's built-in plugins are not available. Libraries passed as `plugin_paths` are loaded as before, so they can register MIGraphX custom operators.

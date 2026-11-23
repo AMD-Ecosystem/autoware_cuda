@@ -5,39 +5,89 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(tensorrt_cmake_module REQUIRED)
 
-find_package(CUDA)
-find_package(CUDAToolkit)
-find_package(TENSORRT)
+option(AUTOWARE_CUDA_USE_HIP "Build with MIGraphX for AMD GPUs even if CUDA is found" OFF)
 
-if(NOT (CUDAToolkit_FOUND AND TENSORRT_FOUND))
+if(NOT AUTOWARE_CUDA_USE_HIP)
+  find_package(CUDA)
+  find_package(CUDAToolkit)
+  find_package(TENSORRT)
+endif()
+
+# Without CUDA, AMD GPUs run the models with MIGraphX through the same API.
+set(${PROJECT_NAME}_USE_HIP FALSE)
+if(NOT CUDAToolkit_FOUND)
+  find_package(hip CONFIG QUIET PATHS $ENV{ROCM_PATH} /opt/rocm)
+  find_package(migraphx CONFIG QUIET PATHS $ENV{ROCM_PATH} /opt/rocm)
+  if(hip_FOUND AND migraphx_FOUND)
+    set(${PROJECT_NAME}_USE_HIP TRUE)
+    message(STATUS "cuda is not found, building autoware_tensorrt_common with MIGraphX ${migraphx_VERSION}")
+  elseif(AUTOWARE_CUDA_USE_HIP)
+    message(FATAL_ERROR "AUTOWARE_CUDA_USE_HIP is ON, but HIP or MIGraphX is not found. "
+      "Add the ROCm and MIGraphX prefixes to CMAKE_PREFIX_PATH or set ROCM_PATH.")
+  endif()
+endif()
+
+if(NOT ${PROJECT_NAME}_USE_HIP AND NOT (CUDAToolkit_FOUND AND TENSORRT_FOUND))
   message(WARNING "cuda, tensorrt libraries are not found")
   return()
 endif()
 
-if(TENSORRT_VERSION VERSION_LESS 10.0)
+if(NOT ${PROJECT_NAME}_USE_HIP AND TENSORRT_VERSION VERSION_LESS 10.0)
   message(WARNING "Unsupported version TensorRT ${TENSORRT_VERSION} detected. This package requires TensorRT 10.0 or later.")
   return()
 endif()
 
-add_library(${PROJECT_NAME} SHARED
-  src/tensorrt_common.cpp
-  src/tensorrt_common_io.cpp
-  src/profiler.cpp
-)
+if(${PROJECT_NAME}_USE_HIP)
+  add_library(${PROJECT_NAME} SHARED
+    src/migraphx_common.cpp
+    src/onnx_model_io.cpp
+    src/tensorrt_common_io.cpp
+    src/profiler.cpp
+  )
 
-target_link_libraries(${PROJECT_NAME}
-  CUDA::cudart
-  rclcpp::rclcpp
-  stdc++fs
-  ${TENSORRT_LIBRARIES}
-)
+  # MIGraphX stays private: the installed headers need only HIP.
+  target_link_libraries(${PROJECT_NAME}
+    PUBLIC
+      hip::host
+      rclcpp::rclcpp
+    PRIVATE
+      migraphx::c
+      stdc++fs
+  )
 
-target_include_directories(${PROJECT_NAME}
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
-    ${TENSORRT_INCLUDE_DIRS}
-)
+  # migraphx/include holds NvInfer.h headers with the TensorRT types used by this API.
+  target_include_directories(${PROJECT_NAME}
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/migraphx/include>
+      $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
+      $<INSTALL_INTERFACE:include/${PROJECT_NAME}/migraphx>
+  )
+else()
+  add_library(${PROJECT_NAME} SHARED
+    src/tensorrt_common.cpp
+    src/tensorrt_common_io.cpp
+    src/profiler.cpp
+  )
+
+  target_link_libraries(${PROJECT_NAME}
+    CUDA::cudart
+    rclcpp::rclcpp
+    stdc++fs
+    ${TENSORRT_LIBRARIES}
+  )
+
+  target_include_directories(${PROJECT_NAME}
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
+      ${TENSORRT_INCLUDE_DIRS}
+  )
+
+  target_compile_definitions(${PROJECT_NAME} PRIVATE
+    TENSORRT_VERSION_MAJOR=${TENSORRT_VERSION_MAJOR}
+  )
+endif()
 
 set_target_properties(${PROJECT_NAME}
   PROPERTIES
@@ -49,10 +99,6 @@ set_target_properties(${PROJECT_NAME}
 # TODO(amadeuszsz): Remove -Wno-deprecated-declarations once removing implicit quantization
 target_compile_options(${PROJECT_NAME} PRIVATE
   -Wall -Wextra -Wpedantic -Werror -Wno-deprecated-declarations
-)
-
-target_compile_definitions(${PROJECT_NAME} PRIVATE
-  TENSORRT_VERSION_MAJOR=${TENSORRT_VERSION_MAJOR}
 )
 
 if(BUILD_TESTING)
@@ -82,6 +128,29 @@ if(BUILD_TESTING)
     target_compile_definitions(${PROJECT_NAME}_test PRIVATE
       DUMMY_ONNX_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/data/dummy_network.onnx"
     )
+    if(${PROJECT_NAME}_USE_HIP)
+      # The HIP build of autoware_cuda_utils puts its cuda_runtime_api.h on the target only.
+      target_link_libraries(${PROJECT_NAME}_test autoware_cuda_utils::autoware_cuda_utils)
+    endif()
+  endif()
+
+  if(${PROJECT_NAME}_USE_HIP)
+    ament_add_gtest(${PROJECT_NAME}_migraphx_test
+      test/migraphx_common_test.cpp
+      TIMEOUT 600
+    )
+    if(TARGET ${PROJECT_NAME}_migraphx_test)
+      target_link_libraries(${PROJECT_NAME}_migraphx_test
+        ${PROJECT_NAME}
+        autoware_cuda_utils::autoware_cuda_utils
+      )
+      target_compile_definitions(${PROJECT_NAME}_migraphx_test PRIVATE
+        TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/data"
+      )
+      # conv_profiler.hpp narrows the int64_t dimensions of TensorRT 10, which consumers do not
+      # see because they include it as a system header.
+      target_compile_options(${PROJECT_NAME}_migraphx_test PRIVATE -Wno-narrowing)
+    endif()
   endif()
 endif()
 
@@ -91,12 +160,20 @@ install(DIRECTORY include/ DESTINATION include/${PROJECT_NAME})
 ament_export_include_directories("include/${PROJECT_NAME}")
 ament_export_targets(export_${PROJECT_NAME})
 
-ament_export_dependencies(
-  "CUDA"
-  "CUDAToolkit"
-  "rclcpp"
-  "tensorrt_cmake_module"
-  "TENSORRT"
-)
+if(${PROJECT_NAME}_USE_HIP)
+  install(DIRECTORY migraphx/include/ DESTINATION include/${PROJECT_NAME}/migraphx)
+  ament_export_include_directories("include/${PROJECT_NAME}/migraphx")
+  # CUDA and TensorRT are not exported: a consumer that found CUDA would stop at the backend check.
+  ament_export_dependencies("rclcpp")
+  set(${PROJECT_NAME}_GPU_CONFIG_EXTRAS cmake/find_hip.cmake)
+else()
+  ament_export_dependencies(
+    "CUDA"
+    "CUDAToolkit"
+    "rclcpp"
+    "tensorrt_cmake_module"
+    "TENSORRT"
+  )
+endif()
 
-ament_package()
+ament_package(CONFIG_EXTRAS ${${PROJECT_NAME}_GPU_CONFIG_EXTRAS} cmake/check_gpu_backend.cmake.in)
