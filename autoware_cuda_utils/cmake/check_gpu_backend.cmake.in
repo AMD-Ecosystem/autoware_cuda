@@ -1,0 +1,40 @@
+# Copyright 2026 The Autoware Foundation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The GPU backend this package was built with. A consumer configured for the
+# other backend would compile these headers against one runtime and link the
+# other, so its configuration stops here instead.
+set(autoware_cuda_utils_USE_HIP @autoware_cuda_utils_USE_HIP@)
+
+function(autoware_cuda_utils_check_gpu_backend)
+  get_property(_languages GLOBAL PROPERTY ENABLED_LANGUAGES)
+  if(autoware_cuda_utils_USE_HIP)
+    if(CUDA_FOUND OR CUDAToolkit_FOUND OR "CUDA" IN_LIST _languages)
+      message(FATAL_ERROR
+        "autoware_cuda_utils was built with HIP, but ${PROJECT_NAME} is "
+        "configured for CUDA. Configure ${PROJECT_NAME} with "
+        "-DAUTOWARE_CUDA_USE_HIP=ON, or rebuild autoware_cuda_utils with CUDA.")
+    endif()
+  elseif(AUTOWARE_CUDA_USE_HIP OR "HIP" IN_LIST _languages)
+    message(FATAL_ERROR
+      "autoware_cuda_utils was built with CUDA, but ${PROJECT_NAME} is "
+      "configured for HIP. Rebuild autoware_cuda_utils with "
+      "-DAUTOWARE_CUDA_USE_HIP=ON, or configure ${PROJECT_NAME} for CUDA.")
+  endif()
+endfunction()
+
+# Check again when the calling directory is done, because packages usually
+# look for CUDA after autoware_package() has found this one.
+autoware_cuda_utils_check_gpu_backend()
+cmake_language(DEFER CALL autoware_cuda_utils_check_gpu_backend)
