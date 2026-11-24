@@ -397,9 +397,24 @@ TEST_F(MigraphxCommonTest, Fp16InferenceIsCloseToFp32)
 {
   auto trt = makeConv("fp16", "fp16");
   ASSERT_TRUE(setupConv(*trt));
-  EXPECT_LT(runConv(*trt, 8), 1e-2F);
+  const auto quantized = runConv(*trt, 8);
+  EXPECT_LT(quantized, 1e-2F);
   ASSERT_EQ(programFiles().size(), 1U);
   EXPECT_NE(programFiles().front().filename().string().find(".fp16.mxr"), std::string::npos);
+
+  // Excluding every computing operation keeps fp32 accuracy, also in the program enqueueV3()
+  // compiles for a new batch size with the operations setup() listed.
+  TrtCommonConfig config(
+    (kDataDir / "conv_network.onnx").string(), "fp16", enginePath("fp16_excluded"), 1ULL << 26U);
+  config.fp16_excluded_ops = {"add", "convolution", "dot", "pooling", "relu"};
+  TrtCommon excluded(config);
+  ASSERT_TRUE(setupConv(excluded));
+  const auto kept = runConv(excluded, 8);
+  std::cout << "largest error: " << quantized << " in fp16, " << kept
+            << " with every operation kept" << std::endl;
+  EXPECT_GT(quantized, 10.0F * kept) << "fp16 was not applied, or not undone";
+  EXPECT_LT(kept, 1e-5F);
+  EXPECT_LT(runConv(excluded, 3), 1e-5F);
 }
 
 TEST_F(MigraphxCommonTest, Int8CalibratesFromTheCalibratorBatches)
@@ -925,7 +940,7 @@ TEST_F(MigraphxCommonTest, OutputDimsFollowingADynamicOneAreDynamicAndNeverWritt
 {
   // pool_network.onnx: x [1, 2, height, 8] -> halved [1, 2, height / 2, 4] and
   // sparse [1, 2, (height - 1) / 300 + 1, 8]. TensorRT reports both heights as -1. sparse has one
-  // row for every height up to 301, including the profile's optimum here, 250.
+  // row for every height up to 300, including the profile's optimum here, 250.
   const nvinfer1::Dims min{4, {1, 2, 2, 8}};
   const nvinfer1::Dims opt{4, {1, 2, 250, 8}};
   const nvinfer1::Dims max{4, {1, 2, 900, 8}};
