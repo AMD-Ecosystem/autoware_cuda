@@ -35,6 +35,7 @@ namespace fs = ::std::experimental::filesystem;
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace autoware
 {
@@ -147,6 +148,12 @@ struct TrtCommonConfig
 
   //!< @brief Flag for per-layer profiler using IProfiler.
   const bool profile_per_layer;
+
+#ifdef AUTOWARE_TENSORRT_COMMON_MIGRAPHX
+  //!< @brief MIGraphX operations (for example "sigmoid", "softmax") kept in fp32 when the
+  //!< precision is "fp16". MIGraphX builds only.
+  std::vector<std::string> fp16_excluded_ops;
+#endif
 };
 
 /**

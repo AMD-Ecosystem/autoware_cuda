@@ -71,18 +71,20 @@ return success;
 
 ## AMD GPUs (ROCm)
 
-When CUDA is not found, the package builds against [MIGraphX](https://github.com/ROCm/AMDMIGraphX) on ROCm instead, with the same classes and headers. The ROCm build puts `NvInfer.h`, `NvInferRuntime.h` and `NvOnnxParser.h` headers on the include path of every package that links `autoware_tensorrt_common`; they declare only the TensorRT types this API uses (`nvinfer1::Dims`, `DataType`, `TensorIOMode`, the logger, profiler and INT8 calibrator interfaces), so code written against `TrtCommon` compiles unchanged.
+When CUDA is not found, the package builds against [MIGraphX](https://github.com/ROCm/AMDMIGraphX) on ROCm instead, with the same classes and headers. The ROCm build puts `NvInfer.h`, `NvInferRuntime.h`, `NvInferRuntimeBase.h` and `NvOnnxParser.h` headers on the include path of every package that links `autoware_tensorrt_common`; they declare only the TensorRT types this API uses (`nvinfer1::Dims`, `DataType`, `TensorIOMode`, the logger, profiler and INT8 calibrator interfaces, and the network, layer and builder configuration interfaces that `getNetwork()` and `getBuilderConfig()` return), so code written against `TrtCommon` compiles unchanged. Including the real TensorRT headers together with them is a compile error.
 
 ```bash
 colcon build --packages-up-to autoware_tensorrt_common \
   --cmake-args -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_HIP_ARCHITECTURES=gfx942
 ```
 
-Pass `-DAUTOWARE_CUDA_USE_HIP=ON` to build with MIGraphX on a machine that also has CUDA, and to every package that links `autoware_tensorrt_common` there. The installed package sets `autoware_tensorrt_common_USE_HIP` to the backend it was built with, and stops the configuration of a package that links it with the other one. ROCm or MIGraphX installed outside `/opt/rocm` needs its prefix in `CMAKE_PREFIX_PATH`.
+Pass `-DAUTOWARE_CUDA_USE_HIP=ON` to build with MIGraphX on a machine that also has CUDA, and to every package that links `autoware_tensorrt_common` there. The installed package records the backend it was built with in `autoware_tensorrt_common_BACKEND` (`tensorrt` or `migraphx`) and `autoware_tensorrt_common_USE_HIP`, and stops the configuration of a package that links it with the other one. ROCm or MIGraphX installed outside `/opt/rocm` needs its prefix in `CMAKE_PREFIX_PATH`.
 
 What differs from TensorRT:
 
-- The compiled program is cached next to the engine path as `<engine name>.<gfx target>.<precision>.mxr`, with a `.mxr.key` file recording the MIGraphX version, GPU and precision; a program built by another MIGraphX, GPU, precision or optimization profile is rebuilt. The `.engine` file itself is not written.
-- Dynamic shapes: `setup()` compiles for the `opt` dimensions of each optimization profile, and `enqueueV3()` compiles once more for every other input shape it meets (within the profile), which takes as long as the first build.
-- `fp16` quantizes the model with MIGraphX. `int8` with `TrtConvCalib` calibrates from the batches of the given calibrator and runs only at the shapes `setup()` compiled; the per-layer settings of `CalibrationConfig` and TensorRT calibration caches are not used.
-- `getNetwork()` and `getBuilderConfig()` return null, per-layer profiling reports nothing, and DLA (`dla_core_id`) and TensorRT's built-in plugins are not available. Libraries passed as `plugin_paths` are loaded as before, so they can register MIGraphX custom operators.
+- The compiled program is cached next to the engine path as `<engine name>.<gfx target>.<precision>.mxr`, with a `.mxr.key` file recording the MIGraphX version, GPU, precision, the size and hash of the ONNX file, and the optimization profile; a program that differs in any of them, or that does not fit the model, is rebuilt. The `.engine` file itself is not written.
+- Dynamic shapes: `setup()` compiles for the `opt` dimensions of each optimization profile, and `enqueueV3()` compiles once more for every other input shape it meets (within the profile), which takes as long as the first build. Compiled programs are kept for the life of the object, and a shape that fails to compile is not tried again.
+- An input with a zero-length dimension (allowed when the profile's `min` is 0) runs when MIGraphX can compile the model for it. Otherwise, when every output is then empty, `enqueueV3()` succeeds without running anything; when not, it fails.
+- `fp16` quantizes the model with MIGraphX. `TrtCommonConfig::fp16_excluded_ops`, a field of the ROCm build only, names MIGraphX operations (for example `sigmoid` or `softmax`) to keep in fp32. `int8` with `TrtConvCalib` calibrates from the batches of the given calibrator and runs only at the shapes `setup()` compiled; the per-layer settings of `CalibrationConfig` and TensorRT calibration caches are not used.
+- `getNetwork()` and `getBuilderConfig()` return null, per-layer profiling reports nothing, and DLA (`dla_core_id`) and TensorRT's built-in plugins are not available.
+- Libraries passed as `plugin_paths` are loaded before the model is read, as before, so they can register MIGraphX custom operators. The MIGraphX ONNX parser does not resolve those operators, though, so a model that uses a custom operator fails to load.

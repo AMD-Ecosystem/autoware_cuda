@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Behavior of the MIGraphX backend that the shared IO tests do not reach: inference results,
-// IO order, dynamic shapes, precisions, and the compiled program cache.
+// IO order, dynamic shapes, precisions, the compiled program cache, and plugin libraries.
 
 #include <autoware/cuda_utils/cuda_gtest_utils.hpp>
 #include <autoware/tensorrt_common/tensorrt_common.hpp>
@@ -21,6 +21,7 @@
 #include <autoware/tensorrt_common/utils.hpp>
 
 #include <NvInfer.h>
+#include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <hip/hip_runtime_api.h>
 
@@ -30,6 +31,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -58,9 +60,26 @@ const nvinfer1::Dims kImageMin{4, {1, kChannels, kSize, kSize}};
 const nvinfer1::Dims kImageOpt{4, {8, kChannels, kSize, kSize}};
 const nvinfer1::Dims kImageMax{4, {kReferenceBatch, kChannels, kSize, kSize}};
 
-nvinfer1::Dims imageDims(const int64_t batch)
+nvinfer1::Dims imageDims(const int64_t batch, const int64_t size = kSize)
 {
-  return nvinfer1::Dims{4, {batch, kChannels, kSize, kSize}};
+  return nvinfer1::Dims{4, {batch, kChannels, size, size}};
+}
+
+void expectDims(const nvinfer1::Dims & actual, const std::vector<int64_t> & expected)
+{
+  ASSERT_EQ(actual.nbDims, static_cast<int32_t>(expected.size()));
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    EXPECT_EQ(actual.d[i], expected[i]) << "dimension " << i;
+  }
+}
+
+std::vector<float> readFloats(const std::filesystem::path & path)
+{
+  std::ifstream file(path, std::ios::binary);
+  std::vector<char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  std::vector<float> values(bytes.size() / sizeof(float));
+  std::copy_n(bytes.data(), values.size() * sizeof(float), reinterpret_cast<char *>(values.data()));
+  return values;
 }
 
 /// Element i of the test input, as generate_conv_network.py builds it.
@@ -174,12 +193,9 @@ protected:
     std::filesystem::create_directories(work_dir_);
     ASSERT_HIP_SUCCESS(hipStreamCreate(&stream_));
 
-    std::ifstream file(kDataDir / "conv_network_reference.bin", std::ios::binary);
-    reference_.resize(kReferenceBatch * (kClasses + kFeatures));
-    file.read(
-      reinterpret_cast<char *>(reference_.data()),  // NOLINT
-      static_cast<std::streamsize>(reference_.size() * sizeof(float)));
-    ASSERT_TRUE(file) << "missing conv_network_reference.bin";
+    reference_ = readFloats(kDataDir / "conv_network_reference.bin");
+    ASSERT_EQ(reference_.size(), kReferenceBatch * (kClasses + kFeatures))
+      << "missing conv_network_reference.bin";
   }
 
   void TearDown() override
@@ -207,18 +223,48 @@ protected:
     return {ProfileDims("image", kImageMin, kImageOpt, kImageMax)};
   }
 
-  static std::vector<NetworkIO> convNetworkIO()
+  static std::vector<NetworkIO> convNetworkIO(
+    const std::string & input = "image", const int64_t size = kSize)
   {
     return {
-      NetworkIO("image", {4, {-1, kChannels, kSize, kSize}}),
-      NetworkIO("logits", {2, {-1, kClasses}}), NetworkIO("features", {2, {-1, kFeatures}})};
+      NetworkIO(input, {4, {-1, kChannels, size, size}}), NetworkIO("logits", {2, {-1, kClasses}}),
+      NetworkIO("features", {2, {-1, kFeatures}})};
   }
 
-  static bool setupConv(TrtCommon & trt)
+  static bool setupConv(TrtCommon & trt, const std::string & input = "image", int64_t size = kSize)
   {
     return trt.setup(
-      std::make_unique<std::vector<ProfileDims>>(convProfile()),
-      std::make_unique<std::vector<NetworkIO>>(convNetworkIO()));
+      std::make_unique<std::vector<ProfileDims>>(std::vector<ProfileDims>{ProfileDims(
+        input, imageDims(1, size), imageDims(8, size), imageDims(kReferenceBatch, size))}),
+      std::make_unique<std::vector<NetworkIO>>(convNetworkIO(input, size)));
+  }
+
+  /// A TrtCommon for the model at `model`, a copy that tests replace, with its program cached in
+  /// `dir`.
+  static std::unique_ptr<TrtCommon> makeAt(
+    const std::filesystem::path & dir, const std::filesystem::path & model,
+    const std::string & precision = "fp32")
+  {
+    return std::make_unique<TrtCommon>(
+      TrtCommonConfig(model.string(), precision, (dir / "model.engine").string(), 1ULL << 26U));
+  }
+
+  /// Copy a test model to `model`, replacing what is there.
+  static void placeModel(const std::string & name, const std::filesystem::path & model)
+  {
+    std::filesystem::create_directories(model.parent_path());
+    std::filesystem::copy_file(
+      kDataDir / name, model, std::filesystem::copy_options::overwrite_existing);
+  }
+
+  [[nodiscard]] std::filesystem::path programIn(const std::filesystem::path & dir) const
+  {
+    for (const auto & entry : std::filesystem::directory_iterator(dir)) {
+      if (entry.path().extension() == ".mxr") {
+        return entry.path();
+      }
+    }
+    return {};
   }
 
   [[nodiscard]] std::vector<std::filesystem::path> programFiles() const
@@ -234,9 +280,14 @@ protected:
 
   /// Run the conv network on `batch` samples and return the largest error against the
   /// reference, with the outputs read from the buffers the caller bound.
-  float runConv(TrtCommon & trt, const int64_t batch)
+  float runConv(
+    TrtCommon & trt, const int64_t batch, const std::string & input = "image",
+    const int64_t size = kSize, const std::vector<float> * reference = nullptr)
   {
-    std::vector<float> image(batch * kChannels * kSize * kSize);
+    if (reference == nullptr) {
+      reference = &reference_;
+    }
+    std::vector<float> image(batch * kChannels * size * size);
     for (std::size_t i = 0; i < image.size(); ++i) {
       image[i] = inputValue(i);
     }
@@ -248,7 +299,7 @@ protected:
     logits_d.upload(std::vector<float>(batch * kClasses, std::nanf("")));
     features_d.upload(std::vector<float>(batch * kFeatures, std::nanf("")));
 
-    EXPECT_TRUE(trt.setTensor("image", image_d.get(), imageDims(batch)));
+    EXPECT_TRUE(trt.setTensor(input.c_str(), image_d.get(), imageDims(batch, size)));
     EXPECT_TRUE(trt.setTensorAddress("logits", logits_d.get()));
     EXPECT_TRUE(trt.setTensorAddress("features", features_d.get()));
     EXPECT_TRUE(trt.enqueueV3(stream_));
@@ -256,8 +307,8 @@ protected:
 
     const auto logits = logits_d.download();
     const auto features = features_d.download();
-    const float * reference_logits = reference_.data();
-    const float * reference_features = reference_.data() + kReferenceBatch * kClasses;
+    const float * reference_logits = reference->data();
+    const float * reference_features = reference->data() + kReferenceBatch * kClasses;
     float max_error = 0.0F;
     const auto compare = [&max_error](float actual, float expected) {
       const auto error = std::fabs(actual - expected);
@@ -457,4 +508,269 @@ TEST_F(MigraphxCommonTest, TensorRTOnlyFeaturesAreRefused)
   EXPECT_THROW(
     TrtCommon(TrtCommonConfig((kDataDir / "conv_network.onnx").string(), "fp32", "", 0, 0)),
     std::runtime_error);
+}
+
+TEST_F(MigraphxCommonTest, ReplacedModelIsRebuiltNotRunStale)
+{
+  const auto dir = work_dir_ / "replaced";
+  const auto model = dir / "model.onnx";
+  placeModel("conv_network.onnx", model);
+  {
+    auto trt = makeAt(dir, model);
+    ASSERT_TRUE(setupConv(*trt));
+    EXPECT_LT(runConv(*trt, 8), 1e-5F);
+  }
+  const auto program = programIn(dir);
+  ASSERT_FALSE(program.empty());
+
+  // Other weights, same inputs and outputs: nothing but the model itself tells the programs apart.
+  placeModel("conv_network_retrained.onnx", model);
+  const auto retrained = readFloats(kDataDir / "conv_network_retrained_reference.bin");
+  ASSERT_EQ(retrained.size(), reference_.size());
+  std::filesystem::last_write_time(
+    program, std::filesystem::last_write_time(program) - std::chrono::hours(1));
+  auto before = std::filesystem::last_write_time(program);
+  {
+    auto trt = makeAt(dir, model);
+    ASSERT_TRUE(setupConv(*trt));
+    EXPECT_GT(std::filesystem::last_write_time(program), before) << "the program was not rebuilt";
+    EXPECT_LT(runConv(*trt, 8, "image", kSize, &retrained), 1e-5F);
+  }
+
+  // Another input size, and the caller's NetworkIO updated to match.
+  placeModel("conv_network_resized.onnx", model);
+  const auto resized = readFloats(kDataDir / "conv_network_resized_reference.bin");
+  ASSERT_EQ(resized.size(), reference_.size());
+  std::filesystem::last_write_time(
+    program, std::filesystem::last_write_time(program) - std::chrono::hours(1));
+  before = std::filesystem::last_write_time(program);
+  {
+    auto trt = makeAt(dir, model);
+    ASSERT_TRUE(setupConv(*trt, "image", 2 * kSize));
+    EXPECT_GT(std::filesystem::last_write_time(program), before) << "the program was not rebuilt";
+    expectDims(trt->getTensorShape("image"), {-1, kChannels, 2 * kSize, 2 * kSize});
+    EXPECT_FALSE(trt->setInputShape("image", imageDims(8)));
+    EXPECT_LT(runConv(*trt, 8, "image", 2 * kSize, &resized), 1e-5F);
+  }
+}
+
+TEST_F(MigraphxCommonTest, RenamedInputIsRebuiltNotRefused)
+{
+  const auto dir = work_dir_ / "renamed";
+  const auto model = dir / "model.onnx";
+  placeModel("conv_network.onnx", model);
+  {
+    auto trt = makeAt(dir, model);
+    ASSERT_TRUE(setupConv(*trt));
+  }
+  placeModel("conv_network_renamed.onnx", model);
+  auto trt = makeAt(dir, model);
+  EXPECT_STREQ(trt->getIOTensorName(0), "pixels");
+  ASSERT_TRUE(setupConv(*trt, "pixels"));
+  EXPECT_LT(runConv(*trt, 8, "pixels"), 1e-5F);
+}
+
+TEST_F(MigraphxCommonTest, CachedProgramThatDoesNotFitTheModelIsRebuilt)
+{
+  // A program compiled from another model under a key that claims this one, as a copied or
+  // half-written cache could leave it: loading it fails, and that means rebuilding.
+  const auto renamed_dir = work_dir_ / "other";
+  placeModel("conv_network_renamed.onnx", renamed_dir / "model.onnx");
+  {
+    auto trt = makeAt(renamed_dir, renamed_dir / "model.onnx");
+    ASSERT_TRUE(setupConv(*trt, "pixels"));
+  }
+  const auto dir = work_dir_ / "mismatch";
+  placeModel("conv_network.onnx", dir / "model.onnx");
+  {
+    auto trt = makeAt(dir, dir / "model.onnx");
+    ASSERT_TRUE(setupConv(*trt));
+  }
+  const auto program = programIn(dir);
+  std::filesystem::copy_file(
+    programIn(renamed_dir), program, std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::last_write_time(
+    program, std::filesystem::last_write_time(program) - std::chrono::hours(1));
+  const auto before = std::filesystem::last_write_time(program);
+
+  auto trt = makeAt(dir, dir / "model.onnx");
+  ASSERT_TRUE(setupConv(*trt));
+  EXPECT_GT(std::filesystem::last_write_time(program), before) << "the program was not rebuilt";
+  EXPECT_LT(runConv(*trt, 8), 1e-5F);
+}
+
+TEST_F(MigraphxCommonTest, SymbolicOutputDimsAreReportedOnceKnown)
+{
+  // Static input: every output dimension is known, as a TensorRT engine reports it.
+  {
+    auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
+      (kDataDir / "conv_network_static_symbolic.onnx").string(), "fp32",
+      enginePath("static_symbolic"), 1ULL << 26U));
+    expectDims(trt->getOutputDims(0), {2, kClasses});
+    const std::vector<NetworkIO> io{
+      NetworkIO("image", imageDims(2)), NetworkIO("logits", {2, {2, kClasses}}),
+      NetworkIO("features", {2, {2, kFeatures}})};
+    ASSERT_TRUE(trt->setup(nullptr, std::make_unique<std::vector<NetworkIO>>(io)));
+    expectDims(trt->getTensorShape("logits"), {2, kClasses});
+    expectDims(trt->getTensorShape("features"), {2, kFeatures});
+    EXPECT_LT(runConv(*trt, 2), 1e-5F);
+  }
+  // Dynamic batch: the dimensions that follow the batch stay -1, the others are known.
+  {
+    auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
+      (kDataDir / "conv_network_dynamic_symbolic.onnx").string(), "fp32",
+      enginePath("dynamic_symbolic"), 1ULL << 26U));
+    ASSERT_TRUE(setupConv(*trt));
+    expectDims(trt->getTensorShape("logits"), {-1, kClasses});
+    expectDims(trt->getTensorShape("features"), {-1, kFeatures});
+    EXPECT_LT(runConv(*trt, 3), 1e-5F);
+  }
+}
+
+TEST_F(MigraphxCommonTest, Fp16CanKeepNamedOperationsInFp32)
+{
+  constexpr int64_t kRows = 4;
+  constexpr int64_t kColumns = 64;
+  const auto reference = readFloats(kDataDir / "activations_reference.bin");
+  ASSERT_EQ(reference.size(), 2U * kRows * kColumns);
+  std::vector<float> x(kRows * kColumns);
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    x[i] = inputValue(i);
+  }
+
+  const auto max_error = [&](const std::vector<std::string> & excluded) {
+    TrtCommonConfig config(
+      (kDataDir / "activations.onnx").string(), "fp16", enginePath("activations"), 1ULL << 26U);
+    config.fp16_excluded_ops = excluded;
+    TrtCommon trt(config);
+    EXPECT_TRUE(trt.setup());
+    DeviceBuffer x_d(x.size());
+    DeviceBuffer sigmoid_d(x.size());
+    DeviceBuffer softmax_d(x.size());
+    x_d.upload(x);
+    EXPECT_TRUE(trt.setTensorAddress("x", x_d.get()));
+    EXPECT_TRUE(trt.setTensorAddress("sigmoid", sigmoid_d.get()));
+    EXPECT_TRUE(trt.setTensorAddress("softmax", softmax_d.get()));
+    EXPECT_TRUE(trt.enqueueV3(stream_));
+    EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+    auto outputs = sigmoid_d.download();
+    const auto softmax = softmax_d.download();
+    outputs.insert(outputs.end(), softmax.begin(), softmax.end());
+    float error = 0.0F;
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+      error = std::max(error, std::fabs(outputs[i] - reference[i]));
+    }
+    return error;
+  };
+
+  // MIGraphX computes the matrix product in fp16 and, here, the activations after it in fp32.
+  const auto quantized = max_error({"sigmoid", "softmax"});
+  // The same engine path: the exclusions are part of what a cached program must match.
+  const auto kept = max_error({"dot", "sigmoid", "softmax"});
+  EXPECT_GT(quantized, 10.0F * kept) << "fp16 was not applied, or not undone";
+  EXPECT_LT(kept, 1e-6F);
+}
+
+TEST_F(MigraphxCommonTest, MalformedModelIsRefused)
+{
+  // A model field 2^64 - 11 bytes long, and a graph input whose name is 2^64 - 1 bytes long.
+  const std::vector<std::vector<unsigned char>> files{
+    {0x12, 0xf5, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01},
+    {0x3a, 0x0d, 0x5a, 0x0b, 0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}};
+  for (std::size_t i = 0; i < files.size(); ++i) {
+    const auto path = work_dir_ / ("malformed_" + std::to_string(i) + ".onnx");
+    std::ofstream(path, std::ios::binary)
+      .write(reinterpret_cast<const char *>(files[i].data()), files[i].size());  // NOLINT
+    EXPECT_THROW(
+      TrtCommon(TrtCommonConfig(path.string(), "fp32", enginePath("malformed"), 1ULL << 26U)),
+      std::runtime_error)
+      << "file " << i;
+  }
+}
+
+TEST_F(MigraphxCommonTest, EmptyInputsRunWhenTheOutputsAllow)
+{
+  constexpr int64_t kColumns = 4;
+  const auto rows_profile = []() {
+    return std::make_unique<std::vector<ProfileDims>>(std::vector<ProfileDims>{
+      ProfileDims("x", {2, {0, kColumns}}, {2, {4, kColumns}}, {2, {16, kColumns}})});
+  };
+
+  // MIGraphX compiles this model for no rows: an empty run that touches nothing.
+  {
+    TrtCommon trt(TrtCommonConfig(
+      (kDataDir / "rows_relu.onnx").string(), "fp32", enginePath("rows_relu"), 1ULL << 26U));
+    ASSERT_TRUE(trt.setup(rows_profile()));
+    ASSERT_TRUE(trt.setTensorAddress("x", nullptr));
+    ASSERT_TRUE(trt.setTensorAddress("relu", nullptr));
+    ASSERT_TRUE(trt.setInputShape("x", {2, {0, kColumns}}));
+    EXPECT_TRUE(trt.enqueueV3(stream_));
+    EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+  }
+
+  // It does not compile the conv network for an empty batch, but every output is empty then, so
+  // there is nothing to compute.
+  {
+    auto trt = makeConv("fp32", "empty_batch");
+    ASSERT_TRUE(trt->setup(
+      std::make_unique<std::vector<ProfileDims>>(
+        std::vector<ProfileDims>{ProfileDims("image", imageDims(0), kImageOpt, kImageMax)})));
+    DeviceBuffer sentinel(1);
+    sentinel.upload({std::nanf("")});
+    ASSERT_TRUE(trt->setTensor("image", sentinel.get(), imageDims(0)));
+    ASSERT_TRUE(trt->setTensorAddress("logits", sentinel.get()));
+    ASSERT_TRUE(trt->setTensorAddress("features", sentinel.get()));
+    EXPECT_TRUE(trt->enqueueV3(stream_));
+    EXPECT_TRUE(trt->enqueueV3(stream_));
+    EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+    EXPECT_TRUE(std::isnan(sentinel.download().front()));
+    // Batches the profile does not start at zero still refuse it.
+    auto other = makeConv("fp32", "empty_batch_refused");
+    ASSERT_TRUE(setupConv(*other));
+    EXPECT_FALSE(other->setInputShape("image", imageDims(0)));
+  }
+
+  // The column sums of no rows are not empty, and MIGraphX cannot compute them: refused, not
+  // skipped.
+  {
+    TrtCommon trt(
+      TrtCommonConfig((kDataDir / "rows.onnx").string(), "fp32", enginePath("rows"), 1ULL << 26U));
+    ASSERT_TRUE(trt.setup(rows_profile()));
+    DeviceBuffer column_sum(kColumns);
+    ASSERT_TRUE(trt.setTensorAddress("x", nullptr));
+    ASSERT_TRUE(trt.setTensorAddress("relu", nullptr));
+    ASSERT_TRUE(trt.setTensorAddress("column_sum", column_sum.get()));
+    ASSERT_TRUE(trt.setInputShape("x", {2, {0, kColumns}}));
+    EXPECT_FALSE(trt.enqueueV3(stream_));
+  }
+}
+
+TEST_F(MigraphxCommonTest, PluginLibrariesAreLoadedBeforeTheModelIsRead)
+{
+  const std::string plugin{TEST_PLUGIN_PATH};
+  const auto profiler = std::make_shared<autoware::tensorrt_common::Profiler>();
+
+  // Loading the library registers its MIGraphX operator. MIGraphX's ONNX parser knows only its
+  // own operators, so a model that calls the registered one is still refused.
+  EXPECT_THROW(
+    TrtCommon(
+      TrtCommonConfig(
+        (kDataDir / "custom_op_network.onnx").string(), "fp32", enginePath("plugin"), 1ULL << 26U),
+      profiler, {plugin}),
+    std::runtime_error);
+  void * handle = dlopen(plugin.c_str(), RTLD_NOW | RTLD_NOLOAD);
+  ASSERT_NE(handle, nullptr) << "plugin_paths did not load " << plugin;
+  const auto registered = reinterpret_cast<int (*)()>(  // NOLINT
+    dlsym(handle, "autoware_tensorrt_common_test_plugin_registered"));
+  ASSERT_NE(registered, nullptr);
+  EXPECT_EQ(registered(), 1);
+  dlclose(handle);
+
+  // A library that cannot be loaded is logged and skipped, as with TensorRT.
+  TrtCommon trt(
+    TrtCommonConfig(
+      (kDataDir / "conv_network.onnx").string(), "fp32", enginePath("no_plugin"), 1ULL << 26U),
+    profiler, {(work_dir_ / "missing.so").string()});
+  ASSERT_TRUE(setupConv(trt));
+  EXPECT_LT(runConv(trt, 8), 1e-5F);
 }

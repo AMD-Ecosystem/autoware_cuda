@@ -15,11 +15,13 @@ endif()
 
 # Without CUDA, AMD GPUs run the models with MIGraphX through the same API.
 set(${PROJECT_NAME}_USE_HIP FALSE)
+set(${PROJECT_NAME}_BACKEND tensorrt)
 if(NOT CUDAToolkit_FOUND)
   find_package(hip CONFIG QUIET PATHS $ENV{ROCM_PATH} /opt/rocm)
   find_package(migraphx CONFIG QUIET PATHS $ENV{ROCM_PATH} /opt/rocm)
   if(hip_FOUND AND migraphx_FOUND)
     set(${PROJECT_NAME}_USE_HIP TRUE)
+    set(${PROJECT_NAME}_BACKEND migraphx)
     message(STATUS "cuda is not found, building autoware_tensorrt_common with MIGraphX ${migraphx_VERSION}")
   elseif(AUTOWARE_CUDA_USE_HIP)
     message(FATAL_ERROR "AUTOWARE_CUDA_USE_HIP is ON, but HIP or MIGraphX is not found. "
@@ -54,6 +56,10 @@ if(${PROJECT_NAME}_USE_HIP)
       migraphx::c
       stdc++fs
   )
+
+  # Also set by the stand-in NvInfer.h; defining it on the target lets tensorrt_common.hpp stop a
+  # consumer whose include path finds the real TensorRT headers first.
+  target_compile_definitions(${PROJECT_NAME} PUBLIC AUTOWARE_TENSORRT_COMMON_MIGRAPHX=1)
 
   # migraphx/include holds NvInfer.h headers with the TensorRT types used by this API.
   target_include_directories(${PROJECT_NAME}
@@ -144,8 +150,18 @@ if(BUILD_TESTING)
         ${PROJECT_NAME}
         autoware_cuda_utils::autoware_cuda_utils
       )
+      # A plugin library as consumers pass in plugin_paths: it registers a MIGraphX operator.
+      add_library(${PROJECT_NAME}_test_plugin MODULE test/custom_op_plugin.cpp)
+      target_link_libraries(${PROJECT_NAME}_test_plugin PRIVATE migraphx::c hip::host)
+      set_target_properties(${PROJECT_NAME}_test_plugin PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+      )
+      add_dependencies(${PROJECT_NAME}_migraphx_test ${PROJECT_NAME}_test_plugin)
       target_compile_definitions(${PROJECT_NAME}_migraphx_test PRIVATE
         TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/data"
+        TEST_PLUGIN_PATH="$<TARGET_FILE:${PROJECT_NAME}_test_plugin>"
       )
       # conv_profiler.hpp narrows the int64_t dimensions of TensorRT 10, which consumers do not
       # see because they include it as a system header.

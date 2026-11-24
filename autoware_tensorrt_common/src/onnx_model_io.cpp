@@ -96,8 +96,12 @@ public:
     if (!varint(size)) {
       return false;
     }
-    field_end = in_.tellg() + static_cast<std::streamoff>(size);
-    return field_end <= end_ || fail();
+    const std::streamoff position = in_.tellg();
+    if (position < 0 || position > end_ || size > static_cast<uint64_t>(end_ - position)) {
+      return fail();
+    }
+    field_end = position + static_cast<std::streamoff>(size);
+    return true;
   }
 
   bool string(std::string & value)

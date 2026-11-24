@@ -20,13 +20,20 @@
 #ifndef NVINFER_H_
 #define NVINFER_H_
 
+#if defined(NV_INFER_H) || defined(NV_TENSORRT_MAJOR)
+#error "TensorRT headers are included together with the MIGraphX build of autoware_tensorrt_common"
+#endif
+
 #include <hip/hip_runtime_api.h>
 
 #include <cstddef>
 #include <cstdint>
 
-// Lets the package headers select their MIGraphX declarations.
+// Lets the package headers select their MIGraphX declarations. The library target also defines
+// it, so that code reaching real TensorRT headers first stops at the check above.
+#ifndef AUTOWARE_TENSORRT_COMMON_MIGRAPHX
 #define AUTOWARE_TENSORRT_COMMON_MIGRAPHX 1
+#endif
 
 #ifndef cudaStream_t
 #define cudaStream_t hipStream_t
@@ -92,6 +99,12 @@ enum class LayerType : int32_t {
   kMATRIX_MULTIPLY,
   kRESIZE,
   kCONSTANT,
+};
+
+enum class ActivationType : int32_t {
+  kRELU = 0,
+  kSIGMOID = 1,
+  kTANH = 2,
 };
 
 enum class LayerInformationFormat : int32_t {
@@ -201,6 +214,7 @@ public:
   virtual const char * getName() const noexcept = 0;
   virtual ITensor * getInput(int32_t index) const noexcept = 0;
   virtual ITensor * getOutput(int32_t index) const noexcept = 0;
+  virtual void setPrecision(DataType dataType) noexcept = 0;
 
 protected:
   virtual ~ILayer() = default;
@@ -214,9 +228,30 @@ public:
   virtual int64_t getNbGroups() const noexcept = 0;
 };
 
-// Opaque: MIGraphX has no builder configuration or network definition to hand out.
-class IBuilderConfig;
-class INetworkDefinition;
+class IActivationLayer : public ILayer
+{
+public:
+  virtual ActivationType getActivationType() const noexcept = 0;
+};
+
+// getNetwork() and getBuilderConfig() return null with MIGraphX, so these are never instantiated
+// either; code that checks for null before using them compiles on both backends.
+class INetworkDefinition
+{
+public:
+  virtual int32_t getNbLayers() const noexcept = 0;
+  virtual ILayer * getLayer(int32_t index) const noexcept = 0;
+
+  virtual ~INetworkDefinition() = default;
+};
+
+class IBuilderConfig
+{
+public:
+  virtual void setMaxAuxStreams(int32_t nbStreams) noexcept = 0;
+
+  virtual ~IBuilderConfig() = default;
+};
 }  // namespace nvinfer1
 
 #endif  // NVINFER_H_

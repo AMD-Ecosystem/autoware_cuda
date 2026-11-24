@@ -22,6 +22,10 @@
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
 
+#if defined(AUTOWARE_TENSORRT_COMMON_MIGRAPHX) && defined(NV_TENSORRT_MAJOR)
+#error "autoware_tensorrt_common was built with MIGraphX, but TensorRT headers are included"
+#endif
+
 #include <memory>
 #include <optional>
 #include <set>
