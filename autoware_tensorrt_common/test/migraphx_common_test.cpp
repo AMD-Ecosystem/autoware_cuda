@@ -132,7 +132,11 @@ public:
     for (std::size_t i = 0; i < values.size(); ++i) {
       values[i] = inputValue(i + batches_served_ * 7);
     }
-    buffer_.upload(values);
+    try {
+      buffer_.upload(values);
+    } catch (const std::exception &) {
+      return false;
+    }
     bindings[0] = buffer_.get();
     ++batches_served_;
     return true;
