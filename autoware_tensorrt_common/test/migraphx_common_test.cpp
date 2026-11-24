@@ -620,7 +620,7 @@ TEST_F(MigraphxCommonTest, CachedProgramThatDoesNotFitTheModelIsRebuilt)
   EXPECT_LT(runConv(*trt, 8), 1e-5F);
 }
 
-TEST_F(MigraphxCommonTest, SymbolicOutputDimsAreReportedOnceKnown)
+TEST_F(MigraphxCommonTest, SymbolicOutputDimsAreKnownOnlyWithStaticInputs)
 {
   // Static input: every output dimension is known, as a TensorRT engine reports it.
   {
@@ -636,14 +636,25 @@ TEST_F(MigraphxCommonTest, SymbolicOutputDimsAreReportedOnceKnown)
     expectDims(trt->getTensorShape("features"), {2, kFeatures});
     EXPECT_LT(runConv(*trt, 2), 1e-5F);
   }
-  // Dynamic batch: the dimensions that follow the batch stay -1, the others are known.
+  // Dynamic batch: every dimension the model leaves symbolic is -1, also the class and feature
+  // counts that TensorRT would report, so NetworkIO entries giving those lengths are refused.
   {
-    auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
-      (kDataDir / "conv_network_dynamic_symbolic.onnx").string(), "fp32",
-      enginePath("dynamic_symbolic"), 1ULL << 26U));
-    ASSERT_TRUE(setupConv(*trt));
-    expectDims(trt->getTensorShape("logits"), {-1, kClasses});
-    expectDims(trt->getTensorShape("features"), {-1, kFeatures});
+    const auto model = (kDataDir / "conv_network_dynamic_symbolic.onnx").string();
+    auto refused = std::make_unique<TrtCommon>(
+      TrtCommonConfig(model, "fp32", enginePath("dynamic_symbolic_refused"), 1ULL << 26U));
+    expectDims(refused->getOutputDims(0), {-1, -1});
+    expectDims(refused->getOutputDims(1), {-1, -1});
+    EXPECT_FALSE(setupConv(*refused));
+
+    auto trt = std::make_unique<TrtCommon>(
+      TrtCommonConfig(model, "fp32", enginePath("dynamic_symbolic"), 1ULL << 26U));
+    ASSERT_TRUE(trt->setup(
+      std::make_unique<std::vector<ProfileDims>>(convProfile()),
+      std::make_unique<std::vector<NetworkIO>>(std::vector<NetworkIO>{
+        NetworkIO("image", {4, {-1, kChannels, kSize, kSize}}), NetworkIO("logits", {2, {-1, -1}}),
+        NetworkIO("features", {2, {-1, -1}})})));
+    expectDims(trt->getTensorShape("logits"), {-1, -1});
+    expectDims(trt->getTensorShape("features"), {-1, -1});
     EXPECT_LT(runConv(*trt, 3), 1e-5F);
   }
 }
@@ -852,7 +863,11 @@ TEST_F(MigraphxCommonTest, Fp16ExclusionsDoNotSerializeTheWeights)
 {
   // 64 MiB of weights behind two operations. Listing the operations for fp16_excluded_ops must not
   // copy the weights into another form (in JSON they took about 40 times their size): building
-  // with exclusions takes little more memory than building without.
+  // with exclusions takes little more memory than building without. The peak is measured through
+  // /proc/self/clear_refs, after a first build that pays MIGraphX's and HIP's one-time setup.
+  if (!resetPeakMemory()) {
+    GTEST_SKIP() << "/proc/self/clear_refs cannot be written, so the peak memory cannot be reset";
+  }
   constexpr std::size_t kRows = 4;
   constexpr std::size_t kInner = 4096;
   constexpr std::size_t kOuter = 4096;
@@ -900,70 +915,107 @@ TEST_F(MigraphxCommonTest, Fp16ExclusionsDoNotSerializeTheWeights)
     EXPECT_LT(error, 1e-2F) << tag;
     return growth;
   };
+  (void)run({}, "large_weights_fp16_warm_up");
   const auto without = run({}, "large_weights_fp16");
   const auto with = run({"sigmoid"}, "large_weights_fp16_excluded");
   EXPECT_LT(with, without + 2 * kWeightBytes);
 }
 
-TEST_F(MigraphxCommonTest, OutputDimsFollowingADynamicOneThroughADivisionStayDynamic)
+TEST_F(MigraphxCommonTest, OutputDimsFollowingADynamicOneAreDynamicAndNeverWrittenPast)
 {
   // pool_network.onnx: x [1, 2, height, 8] -> halved [1, 2, height / 2, 4] and
-  // sparse [1, 2, (height - 1) / 300 + 1, 8]. TensorRT reports both heights as -1.
-  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
-    (kDataDir / "pool_network.onnx").string(), "fp32", enginePath("pool"), 1ULL << 26U));
-  expectDims(trt->getOutputDims(0), {1, 2, -1, 4});
-
+  // sparse [1, 2, (height - 1) / 300 + 1, 8]. TensorRT reports both heights as -1. sparse has one
+  // row for every height up to 301, including the profile's optimum here, 250.
   const nvinfer1::Dims min{4, {1, 2, 2, 8}};
-  const nvinfer1::Dims opt{4, {1, 2, 600, 8}};
+  const nvinfer1::Dims opt{4, {1, 2, 250, 8}};
   const nvinfer1::Dims max{4, {1, 2, 900, 8}};
-  ASSERT_TRUE(trt->setup(
-    std::make_unique<std::vector<ProfileDims>>(
-      std::vector<ProfileDims>{ProfileDims("x", min, opt, max)}),
-    std::make_unique<std::vector<NetworkIO>>(std::vector<NetworkIO>{
-      NetworkIO("x", {4, {1, 2, -1, 8}}), NetworkIO("halved", {4, {1, 2, -1, 4}}),
-      NetworkIO("sparse", {4, {1, 2, -1, 8}})})));
-  expectDims(trt->getTensorShape("halved"), {1, 2, -1, 4});
-  // Every size the model is parsed at before setup() gives the sparse output one row; the program
-  // compiled for the optimal height gives two.
-  expectDims(trt->getTensorShape("sparse"), {1, 2, -1, 8});
+  const auto make = [&](const std::string & tag) {
+    return std::make_unique<TrtCommon>(TrtCommonConfig(
+      (kDataDir / "pool_network.onnx").string(), "fp32", enginePath(tag), 1ULL << 26U));
+  };
+  const auto setup = [&](TrtCommon & trt, const int64_t sparse_height) {
+    return trt.setup(
+      std::make_unique<std::vector<ProfileDims>>(
+        std::vector<ProfileDims>{ProfileDims("x", min, opt, max)}),
+      std::make_unique<std::vector<NetworkIO>>(std::vector<NetworkIO>{
+        NetworkIO("x", {4, {1, 2, -1, 8}}), NetworkIO("halved", {4, {1, 2, -1, 4}}),
+        NetworkIO("sparse", {4, {1, 2, sparse_height, 8}})}));
+  };
 
-  for (const int64_t height : std::vector<int64_t>{600, 10, 301}) {
+  // Runs at `height` with output buffers of the given rows followed by a guard region, checks the
+  // outputs against a CPU max pool, and returns whether the guard regions are untouched.
+  static constexpr std::size_t kGuard = 1024;
+  static constexpr float kSentinel = -12345.0F;
+  const auto run = [&](TrtCommon & trt, const int64_t height, const int64_t sparse_rows) {
     std::vector<float> x(2 * height * 8);
     for (std::size_t i = 0; i < x.size(); ++i) {
       x[i] = inputValue(i);
     }
     const auto halved_rows = height / 2;
-    const auto sparse_rows = (height - 1) / 300 + 1;
+    const auto halved_size = static_cast<std::size_t>(2 * halved_rows * 4);
+    const auto sparse_size = static_cast<std::size_t>(2 * sparse_rows * 8);
     DeviceBuffer x_d(x.size());
-    DeviceBuffer halved_d(2 * halved_rows * 4);
-    DeviceBuffer sparse_d(2 * sparse_rows * 8);
+    DeviceBuffer halved_d(halved_size + kGuard);
+    DeviceBuffer sparse_d(sparse_size + kGuard);
     x_d.upload(x);
-    ASSERT_TRUE(trt->setTensor("x", x_d.get(), {4, {1, 2, height, 8}}));
-    ASSERT_TRUE(trt->setTensorAddress("halved", halved_d.get()));
-    ASSERT_TRUE(trt->setTensorAddress("sparse", sparse_d.get()));
-    ASSERT_TRUE(trt->enqueueV3(stream_)) << "height " << height;
-    ASSERT_HIP_SUCCESS(hipStreamSynchronize(stream_));
+    halved_d.upload(std::vector<float>(halved_size + kGuard, kSentinel));
+    sparse_d.upload(std::vector<float>(sparse_size + kGuard, kSentinel));
+    EXPECT_TRUE(trt.setTensor("x", x_d.get(), {4, {1, 2, height, 8}}));
+    EXPECT_TRUE(trt.setTensorAddress("halved", halved_d.get()));
+    EXPECT_TRUE(trt.setTensorAddress("sparse", sparse_d.get()));
+    EXPECT_TRUE(trt.enqueueV3(stream_)) << "height " << height;
+    EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+    const auto halved = halved_d.download();
+    const auto sparse = sparse_d.download();
     const auto at = [&](int64_t c, int64_t row, int64_t column) {
       return x[(c * height + row) * 8 + column];
     };
-    const auto halved = halved_d.download();
-    const auto sparse = sparse_d.download();
+    const auto true_sparse_rows = (height - 1) / 300 + 1;
     for (int64_t c = 0; c < 2; ++c) {
       for (int64_t row = 0; row < halved_rows; ++row) {
         for (int64_t column = 0; column < 4; ++column) {
           const auto expected = std::max(
             std::max(at(c, 2 * row, 2 * column), at(c, 2 * row, 2 * column + 1)),
             std::max(at(c, 2 * row + 1, 2 * column), at(c, 2 * row + 1, 2 * column + 1)));
-          ASSERT_EQ(halved[(c * halved_rows + row) * 4 + column], expected) << "height " << height;
+          EXPECT_EQ(halved[(c * halved_rows + row) * 4 + column], expected) << "height " << height;
         }
       }
-      for (int64_t row = 0; row < sparse_rows; ++row) {
+      for (int64_t row = 0; sparse_rows == true_sparse_rows && row < sparse_rows; ++row) {
         for (int64_t column = 0; column < 8; ++column) {
-          ASSERT_EQ(sparse[(c * sparse_rows + row) * 8 + column], at(c, 300 * row, column))
+          EXPECT_EQ(sparse[(c * sparse_rows + row) * 8 + column], at(c, 300 * row, column))
             << "height " << height;
         }
       }
     }
+    const auto untouched = [](const std::vector<float> & buffer, std::size_t from) {
+      return std::all_of(
+        buffer.begin() + static_cast<std::ptrdiff_t>(from), buffer.end(),
+        [](float v) { return v == kSentinel; });
+    };
+    return untouched(halved, halved_size) && untouched(sparse, sparse_size);
+  };
+
+  // Before setup() the heights are -1, though sparse has one row at every small height.
+  auto trt = make("pool");
+  expectDims(trt->getOutputDims(0), {1, 2, -1, 4});
+  expectDims(trt->getOutputDims(1), {1, 2, -1, 8});
+
+  // A configuration that takes sparse to have one row, as the program compiled for the optimum
+  // shows, is refused as with TensorRT: a buffer sized from it would be written past at 600.
+  {
+    auto one_row = make("pool_one_row");
+    EXPECT_FALSE(setup(*one_row, 1));
+    if (one_row->getTensorShape("sparse").d[2] == 1) {
+      EXPECT_TRUE(run(*one_row, 600, 1))
+        << "a run wrote past a buffer sized from the reported shape";
+    }
+  }
+
+  ASSERT_TRUE(setup(*trt, -1));
+  for (const int64_t height : std::vector<int64_t>{600, 250, 10, 301, 900, 2}) {
+    EXPECT_TRUE(run(*trt, height, (height - 1) / 300 + 1)) << "height " << height;
+    expectDims(trt->getTensorShape("halved"), {1, 2, -1, 4});
+    expectDims(trt->getTensorShape("sparse"), {1, 2, -1, 8});
   }
 }
 

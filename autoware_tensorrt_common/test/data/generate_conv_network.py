@@ -252,8 +252,9 @@ for name, nodes, inputs, outputs, initializers in (
     save(model, name)
 
 # y = AutowareTestFillSeven(x, buffer) + x = x + 7, where the test plugin library registers the
-# operator. Like every MIGraphX operator that runs on the GPU, it writes its result into the buffer
-# passed as its last input.
+# operator. Like a MIGraphX custom operator that runs on the GPU, it writes its result into the
+# buffer passed as its last input. The `buffer` graph input exists only because nothing in an ONNX
+# graph can supply that allocation; a model written for a TensorRT plugin has no such input.
 custom = helper.make_graph(
     nodes=[
         helper.make_node("AutowareTestFillSeven", ["x", "buffer"], ["sevens"]),

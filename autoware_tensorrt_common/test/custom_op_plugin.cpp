@@ -28,8 +28,8 @@
 
 namespace
 {
-// A MIGraphX operator that runs on the GPU gets no output allocation from MIGraphX: the buffer
-// it writes is its last input, which it returns and declares as its output alias.
+// A MIGraphX custom operator that runs on the GPU gets no output allocation from MIGraphX: the
+// buffer it writes is its last input, which it returns and declares as its output alias.
 struct FillSeven final : migraphx::experimental_custom_op_base
 {
   std::string name() const override { return "AutowareTestFillSeven"; }

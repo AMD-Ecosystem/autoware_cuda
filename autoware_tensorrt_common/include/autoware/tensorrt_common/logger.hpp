@@ -19,6 +19,11 @@
 
 #include <NvInferRuntime.h>
 
+// NV_INFER_VERSION_H is defined by the real TensorRT headers only.
+#if defined(AUTOWARE_TENSORRT_COMMON_MIGRAPHX) && defined(NV_INFER_VERSION_H)
+#error "autoware_tensorrt_common was built with MIGraphX, but TensorRT headers are included"
+#endif
+
 #include <atomic>
 #include <cassert>
 #include <cstdarg>
