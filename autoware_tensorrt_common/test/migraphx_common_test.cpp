@@ -19,6 +19,7 @@
 #include <autoware/tensorrt_common/tensorrt_common.hpp>
 #include <autoware/tensorrt_common/tensorrt_conv_calib.hpp>
 #include <autoware/tensorrt_common/utils.hpp>
+#include <migraphx/migraphx.hpp>
 
 #include <NvInfer.h>
 #include <dlfcn.h>
@@ -29,11 +30,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -130,6 +134,23 @@ private:
   void * data_{nullptr};
   std::size_t count_;
 };
+
+/// Whether MIGraphX itself compiles a test model with `input` of the shape `lens`.
+bool compilesFor(
+  const std::string & model, const std::string & input, std::vector<std::size_t> lens)
+{
+  try {
+    migraphx::onnx_options options;
+    options.set_input_parameter_shape(input, std::move(lens));
+    auto program = migraphx::parse_onnx((kDataDir / model).c_str(), options);
+    migraphx::compile_options compile_options;
+    compile_options.set_offload_copy(false);
+    program.compile(migraphx::target("gpu"), compile_options);
+    return true;
+  } catch (const std::exception &) {
+    return false;
+  }
+}
 
 /// Feeds the test input as calibration batches and records how it is used.
 class TestCalibrator : public nvinfer1::IInt8EntropyCalibrator2
@@ -667,8 +688,283 @@ TEST_F(MigraphxCommonTest, Fp16CanKeepNamedOperationsInFp32)
   const auto quantized = max_error({"sigmoid", "softmax"});
   // The same engine path: the exclusions are part of what a cached program must match.
   const auto kept = max_error({"dot", "sigmoid", "softmax"});
+  std::cout << "largest error: " << quantized << " with the product in fp16, " << kept
+            << " with it in fp32" << std::endl;
   EXPECT_GT(quantized, 10.0F * kept) << "fp16 was not applied, or not undone";
-  EXPECT_LT(kept, 1e-6F);
+  // fp32 rounding, with room for another GPU's exp; fp16 measures about 1.6e-4 here.
+  EXPECT_LT(kept, 1e-5F);
+}
+
+TEST_F(MigraphxCommonTest, Fp16ExclusionsApplyToTheOptimizedProgram)
+{
+  // scaled_sigmoid.onnx divides by a constant, which MIGraphX makes a multiplication before it
+  // converts operations to fp16: excluding the sigmoid still leaves that multiplication in fp16.
+  constexpr int64_t kRows = 4;
+  constexpr int64_t kColumns = 64;
+  const auto reference = readFloats(kDataDir / "scaled_sigmoid_reference.bin");
+  ASSERT_EQ(reference.size(), static_cast<std::size_t>(kRows * kColumns));
+  std::vector<float> x(kRows * kColumns);
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    x[i] = inputValue(i);
+  }
+
+  const auto max_error = [&](const std::vector<std::string> & excluded) {
+    TrtCommonConfig config(
+      (kDataDir / "scaled_sigmoid.onnx").string(), "fp16", enginePath("scaled_sigmoid"),
+      1ULL << 26U);
+    config.fp16_excluded_ops = excluded;
+    TrtCommon trt(config);
+    EXPECT_TRUE(trt.setup());
+    DeviceBuffer x_d(x.size());
+    DeviceBuffer y_d(x.size());
+    x_d.upload(x);
+    EXPECT_TRUE(trt.setTensorAddress("x", x_d.get()));
+    EXPECT_TRUE(trt.setTensorAddress("y", y_d.get()));
+    EXPECT_TRUE(trt.enqueueV3(stream_));
+    EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+    const auto y = y_d.download();
+    float error = 0.0F;
+    for (std::size_t i = 0; i < y.size(); ++i) {
+      error = std::max(error, std::fabs(y[i] - reference[i]));
+    }
+    return error;
+  };
+
+  const auto quantized = max_error({"sigmoid"});
+  const auto kept = max_error({"mul", "sigmoid"});
+  std::cout << "largest error: " << quantized << " with the multiplication in fp16, " << kept
+            << " with it in fp32" << std::endl;
+  EXPECT_GT(quantized, 10.0F * kept) << "the multiplication was not converted to fp16";
+  EXPECT_LT(quantized, 1e-2F);
+  EXPECT_LT(kept, 1e-5F);
+}
+
+namespace
+{
+/// Protobuf encoding, enough to write an ONNX model.
+std::string varint(uint64_t value)
+{
+  std::string bytes;
+  do {
+    auto byte = static_cast<uint8_t>(value & 0x7FU);
+    value >>= 7U;
+    if (value != 0) {
+      byte |= 0x80U;
+    }
+    bytes.push_back(static_cast<char>(byte));
+  } while (value != 0);
+  return bytes;
+}
+
+std::string field(const uint32_t number, const std::string & bytes)
+{
+  return varint((number << 3U) | 2U) + varint(bytes.size()) + bytes;
+}
+
+std::string field(const uint32_t number, const uint64_t value)
+{
+  return varint(number << 3U) + varint(value);
+}
+
+/// An ONNX ValueInfoProto for a float tensor.
+std::string floatTensorInfo(const std::string & name, const std::vector<uint64_t> & dims)
+{
+  std::string shape;
+  for (const auto d : dims) {
+    shape += field(1, field(1, d));
+  }
+  return field(1, name) + field(2, field(1, field(1, uint64_t{1}) + field(2, shape)));
+}
+
+/// Element (k, n) of the weights of the model `writeLargeWeightModel` writes.
+float largeWeight(const std::size_t k, const std::size_t n)
+{
+  return (static_cast<float>((k * 31 + n * 17) % 97) / 97.0F - 0.5F) / 64.0F;
+}
+
+/// y = Sigmoid(x [rows, k] x W [k, n]): a graph of two operations with k * n weights.
+void writeLargeWeightModel(
+  const std::filesystem::path & path, const std::size_t rows, const std::size_t k,
+  const std::size_t n)
+{
+  std::string weights(k * n * sizeof(float), '\0');
+  for (std::size_t i = 0; i < k; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      const auto value = largeWeight(i, j);
+      std::memcpy(&weights[(i * n + j) * sizeof(float)], &value, sizeof(float));
+    }
+  }
+  // TensorProto: dims 1, data_type 2 (1 = float), name 8, raw_data 9.
+  const auto initializer = field(1, uint64_t{k}) + field(1, uint64_t{n}) + field(2, uint64_t{1}) +
+                           field(8, std::string("w")) + field(9, weights);
+  weights.clear();
+  weights.shrink_to_fit();
+  // NodeProto: input 1, output 2, op_type 4. GraphProto: node 1, name 2, initializer 5, input 11,
+  // output 12. ModelProto: ir_version 1, graph 7, opset_import 8.
+  const auto graph = field(
+                       1, field(1, std::string("x")) + field(1, std::string("w")) +
+                            field(2, std::string("product")) + field(4, std::string("MatMul"))) +
+                     field(
+                       1, field(1, std::string("product")) + field(2, std::string("y")) +
+                            field(4, std::string("Sigmoid"))) +
+                     field(2, std::string("large_weights")) + field(5, initializer) +
+                     field(11, floatTensorInfo("x", {rows, k})) +
+                     field(12, floatTensorInfo("y", {rows, n}));
+  const auto model = field(1, uint64_t{9}) + field(7, graph) +
+                     field(8, field(1, std::string()) + field(2, uint64_t{13}));
+  std::ofstream(path, std::ios::binary)
+    .write(model.data(), static_cast<std::streamsize>(model.size()));
+}
+
+/// The largest resident set size since the last `resetPeakMemory()`, in bytes.
+std::size_t peakMemory()
+{
+  std::ifstream status("/proc/self/status");
+  for (std::string line; std::getline(status, line);) {
+    if (line.rfind("VmHWM:", 0) == 0) {
+      return std::stoull(line.substr(6)) * 1024;
+    }
+  }
+  return 0;
+}
+
+std::size_t currentMemory()
+{
+  std::ifstream status("/proc/self/status");
+  for (std::string line; std::getline(status, line);) {
+    if (line.rfind("VmRSS:", 0) == 0) {
+      return std::stoull(line.substr(6)) * 1024;
+    }
+  }
+  return 0;
+}
+
+bool resetPeakMemory()
+{
+  std::ofstream clear_refs("/proc/self/clear_refs");
+  clear_refs << "5";
+  clear_refs.close();
+  return static_cast<bool>(clear_refs);
+}
+}  // namespace
+
+TEST_F(MigraphxCommonTest, Fp16ExclusionsDoNotSerializeTheWeights)
+{
+  // 64 MiB of weights behind two operations. Listing the operations for fp16_excluded_ops must not
+  // copy the weights into another form (in JSON they took about 40 times their size): building
+  // with exclusions takes little more memory than building without.
+  constexpr std::size_t kRows = 4;
+  constexpr std::size_t kInner = 4096;
+  constexpr std::size_t kOuter = 4096;
+  constexpr std::size_t kWeightBytes = kInner * kOuter * sizeof(float);
+  const auto model = work_dir_ / "large_weights.onnx";
+  writeLargeWeightModel(model, kRows, kInner, kOuter);
+
+  std::vector<float> x(kRows * kInner);
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    x[i] = inputValue(i);
+  }
+  std::vector<double> reference(kRows * kOuter, 0.0);
+  for (std::size_t r = 0; r < kRows; ++r) {
+    for (std::size_t k = 0; k < kInner; ++k) {
+      for (std::size_t n = 0; n < kOuter; ++n) {
+        reference[r * kOuter + n] += static_cast<double>(x[r * kInner + k]) * largeWeight(k, n);
+      }
+    }
+  }
+
+  // Returns how much the resident memory grew at most while the model was read and compiled.
+  const auto run = [&](const std::vector<std::string> & excluded, const std::string & tag) {
+    TrtCommonConfig config(model.string(), "fp16", enginePath(tag), 1ULL << 26U);
+    config.fp16_excluded_ops = excluded;
+    EXPECT_TRUE(resetPeakMemory());
+    const auto before = currentMemory();
+    TrtCommon trt(config);
+    EXPECT_TRUE(trt.setup());
+    const auto growth = peakMemory() - before;
+    std::cout << tag << ": resident memory grew by " << growth / (1U << 20U)
+              << " MiB at most while the model was read and compiled" << std::endl;
+    DeviceBuffer x_d(x.size());
+    DeviceBuffer y_d(kRows * kOuter);
+    x_d.upload(x);
+    EXPECT_TRUE(trt.setTensorAddress("x", x_d.get()));
+    EXPECT_TRUE(trt.setTensorAddress("y", y_d.get()));
+    EXPECT_TRUE(trt.enqueueV3(stream_));
+    EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+    const auto y = y_d.download();
+    float error = 0.0F;
+    for (std::size_t i = 0; i < y.size(); ++i) {
+      const auto expected = 1.0 / (1.0 + std::exp(-reference[i]));
+      error = std::max(error, static_cast<float>(std::fabs(y[i] - expected)));
+    }
+    EXPECT_LT(error, 1e-2F) << tag;
+    return growth;
+  };
+  const auto without = run({}, "large_weights_fp16");
+  const auto with = run({"sigmoid"}, "large_weights_fp16_excluded");
+  EXPECT_LT(with, without + 2 * kWeightBytes);
+}
+
+TEST_F(MigraphxCommonTest, OutputDimsFollowingADynamicOneThroughADivisionStayDynamic)
+{
+  // pool_network.onnx: x [1, 2, height, 8] -> halved [1, 2, height / 2, 4] and
+  // sparse [1, 2, (height - 1) / 300 + 1, 8]. TensorRT reports both heights as -1.
+  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
+    (kDataDir / "pool_network.onnx").string(), "fp32", enginePath("pool"), 1ULL << 26U));
+  expectDims(trt->getOutputDims(0), {1, 2, -1, 4});
+
+  const nvinfer1::Dims min{4, {1, 2, 2, 8}};
+  const nvinfer1::Dims opt{4, {1, 2, 600, 8}};
+  const nvinfer1::Dims max{4, {1, 2, 900, 8}};
+  ASSERT_TRUE(trt->setup(
+    std::make_unique<std::vector<ProfileDims>>(
+      std::vector<ProfileDims>{ProfileDims("x", min, opt, max)}),
+    std::make_unique<std::vector<NetworkIO>>(std::vector<NetworkIO>{
+      NetworkIO("x", {4, {1, 2, -1, 8}}), NetworkIO("halved", {4, {1, 2, -1, 4}}),
+      NetworkIO("sparse", {4, {1, 2, -1, 8}})})));
+  expectDims(trt->getTensorShape("halved"), {1, 2, -1, 4});
+  // Every size the model is parsed at before setup() gives the sparse output one row; the program
+  // compiled for the optimal height gives two.
+  expectDims(trt->getTensorShape("sparse"), {1, 2, -1, 8});
+
+  for (const int64_t height : std::vector<int64_t>{600, 10, 301}) {
+    std::vector<float> x(2 * height * 8);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      x[i] = inputValue(i);
+    }
+    const auto halved_rows = height / 2;
+    const auto sparse_rows = (height - 1) / 300 + 1;
+    DeviceBuffer x_d(x.size());
+    DeviceBuffer halved_d(2 * halved_rows * 4);
+    DeviceBuffer sparse_d(2 * sparse_rows * 8);
+    x_d.upload(x);
+    ASSERT_TRUE(trt->setTensor("x", x_d.get(), {4, {1, 2, height, 8}}));
+    ASSERT_TRUE(trt->setTensorAddress("halved", halved_d.get()));
+    ASSERT_TRUE(trt->setTensorAddress("sparse", sparse_d.get()));
+    ASSERT_TRUE(trt->enqueueV3(stream_)) << "height " << height;
+    ASSERT_HIP_SUCCESS(hipStreamSynchronize(stream_));
+    const auto at = [&](int64_t c, int64_t row, int64_t column) {
+      return x[(c * height + row) * 8 + column];
+    };
+    const auto halved = halved_d.download();
+    const auto sparse = sparse_d.download();
+    for (int64_t c = 0; c < 2; ++c) {
+      for (int64_t row = 0; row < halved_rows; ++row) {
+        for (int64_t column = 0; column < 4; ++column) {
+          const auto expected = std::max(
+            std::max(at(c, 2 * row, 2 * column), at(c, 2 * row, 2 * column + 1)),
+            std::max(at(c, 2 * row + 1, 2 * column), at(c, 2 * row + 1, 2 * column + 1)));
+          ASSERT_EQ(halved[(c * halved_rows + row) * 4 + column], expected) << "height " << height;
+        }
+      }
+      for (int64_t row = 0; row < sparse_rows; ++row) {
+        for (int64_t column = 0; column < 8; ++column) {
+          ASSERT_EQ(sparse[(c * sparse_rows + row) * 8 + column], at(c, 300 * row, column))
+            << "height " << height;
+        }
+      }
+    }
+  }
 }
 
 TEST_F(MigraphxCommonTest, MalformedModelIsRefused)
@@ -696,21 +992,32 @@ TEST_F(MigraphxCommonTest, EmptyInputsRunWhenTheOutputsAllow)
       ProfileDims("x", {2, {0, kColumns}}, {2, {4, kColumns}}, {2, {16, kColumns}})});
   };
 
-  // MIGraphX compiles this model for no rows: an empty run that touches nothing.
+  // MIGraphX compiles rows_scaled.onnx for no rows: the run computes the second output, b * 2,
+  // and the empty input and output are given no memory.
   {
+    ASSERT_TRUE(compilesFor("rows_scaled.onnx", "x", {0, kColumns}));
     TrtCommon trt(TrtCommonConfig(
-      (kDataDir / "rows_relu.onnx").string(), "fp32", enginePath("rows_relu"), 1ULL << 26U));
+      (kDataDir / "rows_scaled.onnx").string(), "fp32", enginePath("rows_scaled"), 1ULL << 26U));
     ASSERT_TRUE(trt.setup(rows_profile()));
+    DeviceBuffer b(kColumns);
+    DeviceBuffer scaled(kColumns);
+    b.upload({1.0F, -2.0F, 3.5F, 0.25F});
+    scaled.upload(std::vector<float>(kColumns, std::nanf("")));
     ASSERT_TRUE(trt.setTensorAddress("x", nullptr));
+    ASSERT_TRUE(trt.setTensorAddress("b", b.get()));
     ASSERT_TRUE(trt.setTensorAddress("relu", nullptr));
+    ASSERT_TRUE(trt.setTensorAddress("scaled", scaled.get()));
     ASSERT_TRUE(trt.setInputShape("x", {2, {0, kColumns}}));
     EXPECT_TRUE(trt.enqueueV3(stream_));
     EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+    const std::vector<float> expected{2.0F, -4.0F, 7.0F, 0.5F};
+    EXPECT_EQ(scaled.download(), expected);
   }
 
   // It does not compile the conv network for an empty batch, but every output is empty then, so
-  // there is nothing to compute.
+  // there is nothing to compute and nothing is run.
   {
+    ASSERT_FALSE(compilesFor("conv_network.onnx", "image", {0, kChannels, kSize, kSize}));
     auto trt = makeConv("fp32", "empty_batch");
     ASSERT_TRUE(trt->setup(
       std::make_unique<std::vector<ProfileDims>>(
@@ -733,6 +1040,7 @@ TEST_F(MigraphxCommonTest, EmptyInputsRunWhenTheOutputsAllow)
   // The column sums of no rows are not empty, and MIGraphX cannot compute them: refused, not
   // skipped.
   {
+    ASSERT_FALSE(compilesFor("rows.onnx", "x", {0, kColumns}));
     TrtCommon trt(
       TrtCommonConfig((kDataDir / "rows.onnx").string(), "fp32", enginePath("rows"), 1ULL << 26U));
     ASSERT_TRUE(trt.setup(rows_profile()));
@@ -764,6 +1072,28 @@ TEST_F(MigraphxCommonTest, PluginLibrariesAreLoadedBeforeTheModelIsRead)
     dlsym(handle, "autoware_tensorrt_common_test_plugin_registered"));
   ASSERT_NE(registered, nullptr);
   EXPECT_EQ(registered(), 1);
+
+  // The registered operator works in a program built through the MIGraphX API, where its output
+  // buffer is an allocation passed as its last input: y = AutowareTestFillSeven(x, buffer) + x.
+  migraphx::program program;
+  auto main_module = program.get_main_module();
+  const migraphx::shape shape{migraphx_shape_float_type, {16}};
+  const auto x = main_module.add_parameter("x", shape);
+  const auto sevens = main_module.add_instruction(
+    migraphx::operation("AutowareTestFillSeven"), {x, main_module.add_allocation(shape)});
+  main_module.add_return({main_module.add_instruction(migraphx::operation("add"), {sevens, x})});
+  migraphx::compile_options options;
+  options.set_offload_copy();
+  program.compile(migraphx::target("gpu"), options);
+  std::vector<float> values(16);
+  std::iota(values.begin(), values.end(), 0.0F);
+  migraphx::program_parameters parameters;
+  parameters.add("x", migraphx::argument(shape, values.data()));
+  const auto y = program.eval(parameters)[0].as_vector<float>();
+  ASSERT_EQ(y.size(), values.size());
+  for (std::size_t i = 0; i < y.size(); ++i) {
+    EXPECT_EQ(y[i], values[i] + 7.0F) << "element " << i;
+  }
   dlclose(handle);
 
   // A library that cannot be loaded is logged and skipped, as with TensorRT.

@@ -26,18 +26,17 @@
 #include <dlfcn.h>
 #include <hip/hip_runtime_api.h>
 #include <migraphx/version.h>
-#include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
-#include <iterator>
+#include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -181,72 +180,95 @@ std::optional<std::vector<Lens>> outputLens(const migraphx::program & program)
   return lens;
 }
 
+/// Sizes the dynamic input dimensions are given to tell the output dimensions that follow them from
+/// those that do not: small and large, so that a floor or ceiling division by a small factor
+/// (pooling, a strided convolution) differs between at least two of them. A dimension that agrees
+/// at all of them anyway is corrected when a program is compiled.
+constexpr std::array<unsigned int, 4> kDimensionSamples{2U, 3U, 64U, 255U};
+
 /**
- * Give output dimensions the model leaves symbolic the value shape inference finds, as TensorRT
- * reports them: a dimension that does not depend on a dynamic input dimension is known. With
- * static inputs that is the shape of `parsed`; otherwise the model is parsed with the dynamic
- * dimensions at two different values, and a dimension that changes stays -1.
+ * Output dimensions as TensorRT reports them: a dimension the model leaves symbolic is known when
+ * it does not depend on a dynamic input dimension. With static inputs that is the shape of
+ * `parsed`. Otherwise the model is parsed with every dynamic dimension at each of
+ * `kDimensionSamples`, and a dimension that is the same in all of them that parse (at least two)
+ * is known; a compiled program that shows otherwise takes it back (`forgetDimsThatDiffer`).
  */
-void resolveOutputDims(
-  OnnxModelIO & model, const migraphx::program & parsed, const fs::path & onnx_path)
+std::vector<std::optional<std::vector<int64_t>>> resolveOutputDims(
+  const OnnxModelIO & model, const migraphx::program & parsed, const fs::path & onnx_path)
 {
+  std::vector<std::optional<std::vector<int64_t>>> dims;
+  for (const auto & output : model.outputs) {
+    dims.push_back(output.dims);
+  }
   const auto is_resolved = [](const OnnxTensor & tensor) {
     return tensor.dims &&
            std::all_of(tensor.dims->begin(), tensor.dims->end(), [](auto d) { return d >= 0; });
   };
   if (std::all_of(model.outputs.begin(), model.outputs.end(), is_resolved)) {
-    return;
+    return dims;
   }
 
-  std::vector<std::optional<std::vector<Lens>>> samples;
+  std::vector<std::vector<Lens>> samples;
   if (std::all_of(model.inputs.begin(), model.inputs.end(), is_resolved)) {
-    samples.push_back(outputLens(parsed));
+    if (auto sample = outputLens(parsed)) {
+      samples.push_back(std::move(*sample));
+    }
   } else {
-    for (const unsigned int value : {2U, 3U}) {
+    for (const auto value : kDimensionSamples) {
       try {
         migraphx::onnx_options options;
         options.set_default_dim_value(value);
-        samples.push_back(outputLens(migraphx::parse_onnx(onnx_path.c_str(), options)));
+        if (auto sample = outputLens(migraphx::parse_onnx(onnx_path.c_str(), options))) {
+          samples.push_back(std::move(*sample));
+        }
       } catch (const std::exception &) {
-        return;
+        // Some models do not parse at some sizes; the others still tell.
       }
     }
+    if (samples.size() < 2) {
+      return dims;
+    }
+  }
+  if (samples.empty()) {
+    return dims;
   }
   for (const auto & sample : samples) {
-    if (!sample || sample->size() != model.outputs.size()) {
-      return;
+    if (sample.size() != model.outputs.size()) {
+      return dims;
     }
   }
 
   for (std::size_t o = 0; o < model.outputs.size(); ++o) {
-    auto & output = model.outputs[o];
-    const auto & lens = samples.front()->at(o);
+    const auto & lens = samples.front()[o];
     if (std::any_of(samples.begin(), samples.end(), [&](const auto & sample) {
-          return sample->at(o).size() != lens.size();
+          return sample[o].size() != lens.size();
         })) {
       continue;
     }
-    if (!output.dims) {
-      output.dims = std::vector<int64_t>(lens.size(), -1);
+    auto & output = dims[o];
+    if (!output) {
+      output = std::vector<int64_t>(lens.size(), -1);
     }
-    if (output.dims->size() != lens.size()) {
+    if (output->size() != lens.size()) {
       continue;
     }
     for (std::size_t i = 0; i < lens.size(); ++i) {
       const auto constant = std::all_of(samples.begin(), samples.end(), [&](const auto & sample) {
-        return sample->at(o)[i] == lens[i];
+        return sample[o][i] == lens[i];
       });
-      if ((*output.dims)[i] < 0 && constant) {
-        (*output.dims)[i] = static_cast<int64_t>(lens[i]);
+      if ((*output)[i] < 0 && constant) {
+        (*output)[i] = static_cast<int64_t>(lens[i]);
       }
     }
   }
+  return dims;
 }
 
-/// Whether every output is empty when the inputs have the lengths `input_lens`, some of them
-/// zero. MIGraphX may not compile such shapes, so the model is parsed with each zero length set to
-/// 2 and to 3: an output dimension proportional to it is empty at zero.
-bool outputsAreEmpty(
+/// Which outputs are empty when the inputs have the lengths `input_lens`, some of them zero, or
+/// nullopt if that cannot be told. MIGraphX may not compile such shapes, so the model is parsed
+/// with each zero length set to 2 and to 3: an output dimension proportional to it is empty at
+/// zero.
+std::optional<std::vector<bool>> emptyOutputs(
   const OnnxModelIO & model, const std::vector<Lens> & input_lens, const fs::path & onnx_path)
 {
   std::vector<std::vector<Lens>> samples;
@@ -263,69 +285,74 @@ bool outputsAreEmpty(
     try {
       auto sample = outputLens(migraphx::parse_onnx(onnx_path.c_str(), options));
       if (!sample || sample->size() != model.outputs.size()) {
-        return false;
+        return std::nullopt;
       }
       samples.push_back(std::move(*sample));
     } catch (const std::exception &) {
-      return false;
+      return std::nullopt;
     }
   }
+  std::vector<bool> empty(model.outputs.size(), false);
   for (std::size_t o = 0; o < model.outputs.size(); ++o) {
     const auto & at_two = samples[0][o];
     const auto & at_three = samples[1][o];
     if (at_two.size() != at_three.size()) {
-      return false;
+      return std::nullopt;
     }
-    bool empty = false;
     for (std::size_t i = 0; i < at_two.size(); ++i) {
-      empty = empty || (at_two[i] > 0 && at_two[i] * 3 == at_three[i] * 2);
-    }
-    if (!empty) {
-      return false;
+      empty[o] = empty[o] || (at_two[i] > 0 && at_two[i] * 3 == at_three[i] * 2);
     }
   }
-  return true;
+  return empty;
 }
 
 /**
- * Names of the operations in `program`. The MIGraphX API exposes them only in a saved program, so
- * the program is saved as JSON and every "name" string in it is collected; the module and
- * parameter names that come along are harmless where the names are used to select operations.
+ * Names of the operations in `program`, read from its printed form: the MIGraphX API lists them
+ * nowhere else. Printing shows any constant of more than ten elements as "{ ... }", so the text
+ * grows with the graph and not with the weights. MIGraphX prints to std::cout, which is redirected
+ * meanwhile; output other threads write to std::cout in that time is lost.
  */
 std::set<std::string> operationNames(const migraphx::program & program)
 {
-  std::string path = (fs::temp_directory_path() / "autoware_tensorrt_common_XXXXXX").string();
-  const int fd = mkstemp(path.data());
-  if (fd < 0) {
-    throw std::runtime_error("Fail to create a temporary file");
-  }
-  close(fd);
-  std::string json;
-  try {
-    migraphx::file_options options;
-    options.set_file_format("json");
-    migraphx::save(program, path.c_str(), options);
-    std::ifstream in(path);
-    json.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-  } catch (...) {
-    std::remove(path.c_str());
-    throw;
-  }
-  std::remove(path.c_str());
-
-  std::set<std::string> names;
-  const std::string key = "\"name\":\"";
-  for (auto at = json.find(key); at != std::string::npos; at = json.find(key, at)) {
-    at += key.size();
-    const auto end = json.find('"', at);
-    if (end == std::string::npos) {
-      break;
+  static std::mutex print_mutex;
+  std::ostringstream text;
+  {
+    const std::lock_guard<std::mutex> lock(print_mutex);
+    std::cout.flush();
+    auto * const previous = std::cout.rdbuf(text.rdbuf());
+    try {
+      program.print();
+    } catch (...) {
+      std::cout.rdbuf(previous);
+      throw;
     }
-    names.insert(json.substr(at, end - at));
-    at = end;
+    std::cout.rdbuf(previous);
+  }
+  const auto printed = text.str();
+  if (printed.find("@return") == std::string::npos) {
+    throw std::runtime_error("Fail to list the operations of the model");
+  }
+
+  // Instructions print as "<result> = <operation>[<attributes>](<arguments>) -> <shape>";
+  // operations starting with '@' are parameters, constants and the like.
+  std::set<std::string> names;
+  std::istringstream lines(printed);
+  for (std::string line; std::getline(lines, line);) {
+    const auto start = line.find(" = ");
+    if (start == std::string::npos) {
+      continue;
+    }
+    auto name = line.substr(start + 3);
+    name.resize(std::min(name.size(), name.find_first_of("[({ ")));
+    if (!name.empty() && name.front() != '@') {
+      names.insert(name);
+    }
   }
   return names;
 }
+
+/// An operation name no MIGraphX operation has.
+constexpr const char * kNoOperation = "autoware_tensorrt_common_no_operation";
 
 constexpr const char * kProfilePrefix = "profile ";
 
@@ -359,9 +386,11 @@ struct CompiledProgram
 
 struct TrtCommon::MigraphxState
 {
-  //!< Inputs and outputs the ONNX model declares, in its order: the IO tensor indices. Output
-  //!< dimensions that shape inference resolves are filled in.
+  //!< Inputs and outputs the ONNX model declares, in its order: the IO tensor indices.
   OnnxModelIO model;
+  //!< Output dimensions as reported: the declared ones, with those shape inference finds known
+  //!< filled in.
+  std::vector<std::optional<std::vector<int64_t>>> output_dims;
   //!< Size and hash of the ONNX file, recorded with a cached program.
   std::string model_fingerprint;
   //!< Device architecture the programs are compiled for.
@@ -390,6 +419,33 @@ struct TrtCommon::MigraphxState
   [[nodiscard]] const OnnxTensor & tensor(const int32_t index) const
   {
     return index < numInputs() ? model.inputs.at(index) : model.outputs.at(index - numInputs());
+  }
+  [[nodiscard]] const std::optional<std::vector<int64_t>> & reportedDims(const int32_t index) const
+  {
+    return index < numInputs() ? model.inputs.at(index).dims : output_dims.at(index - numInputs());
+  }
+  /// Report as dynamic again an output dimension taken as known that `compiled` has at another
+  /// length.
+  void forgetDimsThatDiffer(const CompiledProgram & compiled)
+  {
+    for (const auto & binding : compiled.bindings) {
+      if (binding.index < numInputs()) {
+        continue;
+      }
+      auto & dims = output_dims.at(binding.index - numInputs());
+      const auto & declared = tensor(binding.index).dims;
+      const auto lens = binding.shape.lengths();
+      if (!dims || dims->size() != lens.size()) {
+        continue;
+      }
+      for (std::size_t i = 0; i < lens.size(); ++i) {
+        const auto was_symbolic =
+          !declared || declared->size() != lens.size() || (*declared)[i] < 0;
+        if (was_symbolic && (*dims)[i] >= 0 && static_cast<std::size_t>((*dims)[i]) != lens[i]) {
+          (*dims)[i] = -1;
+        }
+      }
+    }
   }
   [[nodiscard]] std::optional<int32_t> indexOf(const char * name) const
   {
@@ -470,10 +526,33 @@ bool TrtCommon::initialize()
     return false;
   }
 
-  // Parse once so that a model MIGraphX cannot read fails here, as it does with TensorRT.
+  // Parse once so that a model MIGraphX cannot read fails here, as it does with TensorRT. MIGraphX
+  // gives dynamic dimensions the length 1, which not every model accepts (a pooling window does
+  // not fit), so the sample lengths are tried as well.
+  std::optional<migraphx::program> parsed;
+  std::string parse_error;
+  for (std::size_t attempt = 0; !parsed && attempt <= kDimensionSamples.size(); ++attempt) {
+    try {
+      migraphx::onnx_options options;
+      if (attempt > 0) {
+        options.set_default_dim_value(kDimensionSamples[attempt - 1]);
+      }
+      parsed = migraphx::parse_onnx(trt_config_->onnx_path.c_str(), options);
+    } catch (const std::exception & e) {
+      if (attempt == 0) {
+        parse_error = e.what();
+      }
+    }
+  }
+  if (!parsed) {
+    logger_->log(
+      nvinfer1::ILogger::Severity::kERROR, "Fail to parse %s: %s", trt_config_->onnx_path.c_str(),
+      parse_error.c_str());
+    return false;
+  }
+  std::vector<std::optional<std::vector<int64_t>>> output_dims;
   try {
-    const auto parsed = migraphx::parse_onnx(trt_config_->onnx_path.c_str());
-    resolveOutputDims(*model, parsed, trt_config_->onnx_path);
+    output_dims = resolveOutputDims(*model, *parsed, trt_config_->onnx_path);
   } catch (const std::exception & e) {
     logger_->log(
       nvinfer1::ILogger::Severity::kERROR, "Fail to parse %s: %s", trt_config_->onnx_path.c_str(),
@@ -494,6 +573,7 @@ bool TrtCommon::initialize()
 
   migraphx_ = std::make_unique<MigraphxState>();
   migraphx_->model = std::move(*model);
+  migraphx_->output_dims = std::move(output_dims);
   migraphx_->model_fingerprint = *fingerprint;
   migraphx_->arch = *arch;
   migraphx_->addresses.assign(migraphx_->numTensors(), nullptr);
@@ -525,7 +605,7 @@ struct ProgramBuilder
     const migraphx::target gpu("gpu");
 
     if (config.precision == "fp16") {
-      quantizeFp16(program);
+      quantizeFp16(program, options);
     } else if (config.precision == "int8") {
       quantizeInt8(program, gpu);
     }
@@ -537,16 +617,23 @@ struct ProgramBuilder
     return program;
   }
 
-  void quantizeFp16(migraphx::program & program) const
+  void quantizeFp16(migraphx::program & program, const migraphx::onnx_options & options) const
   {
     if (config.fp16_excluded_ops.empty()) {
       migraphx::quantize_fp16(program);
       return;
     }
-    // MIGraphX takes the operations to quantize, so name every other one in the program.
+    // MIGraphX takes the operations to quantize, so name every other one. It converts them after
+    // normalizing and optimizing the program, which can bring in operations the parsed model does
+    // not have (a division by a constant becomes a multiplication), so the names come from a second
+    // parse put through the same passes by a quantization that matches no operation.
     const std::set<std::string> excluded(
       config.fp16_excluded_ops.begin(), config.fp16_excluded_ops.end());
-    const auto operations = operationNames(program);
+    auto optimized = migraphx::parse_onnx(config.onnx_path.c_str(), options);
+    migraphx::quantize_op_names no_operation;
+    no_operation.add(kNoOperation);
+    migraphx::quantize_fp16(optimized, no_operation);
+    const auto operations = operationNames(optimized);
     for (const auto & op : excluded) {
       if (operations.count(op) == 0) {
         logger.log(
@@ -555,7 +642,9 @@ struct ProgramBuilder
           op.c_str());
       }
     }
+    // MIGraphX reads an empty list as every operation, so the list is never empty.
     migraphx::quantize_op_names names;
+    names.add(kNoOperation);
     for (const auto & op : operations) {
       if (excluded.count(op) == 0) {
         names.add(op);
@@ -635,10 +724,12 @@ bool matchesModel(const Lens & lens, const OnnxTensor & tensor)
   return true;
 }
 
-/// Map each parameter of a compiled program to the IO tensor it binds.
+/// Map each parameter of a compiled program to the IO tensor it binds. Outputs flagged in
+/// `empty_outputs` may have no parameter: MIGraphX leaves out an output with no elements.
 /// @throw std::runtime_error If the program does not fit the model's inputs and outputs.
 std::shared_ptr<CompiledProgram> describeProgram(
-  migraphx::program program, const OnnxModelIO & model)
+  migraphx::program program, const OnnxModelIO & model,
+  const std::vector<bool> & empty_outputs = {})
 {
   auto compiled = std::make_shared<CompiledProgram>();
   const auto num_inputs = model.inputs.size();
@@ -681,8 +772,11 @@ std::shared_ptr<CompiledProgram> describeProgram(
       throw std::runtime_error("Compiled program binds an output twice: " + binding.name);
     }
   }
-  if (outputs.size() != model.outputs.size()) {
-    throw std::runtime_error("Compiled program does not return every output of the model");
+  for (std::size_t o = 0; o < model.outputs.size(); ++o) {
+    const auto empty = o < empty_outputs.size() && empty_outputs[o];
+    if (!empty && outputs.count(static_cast<int32_t>(num_inputs + o)) == 0) {
+      throw std::runtime_error("Compiled program does not return every output of the model");
+    }
   }
   compiled->program = std::move(program);
   return compiled;
@@ -806,7 +900,7 @@ nvinfer1::Dims TrtCommon::getTensorShape(const int32_t index) const
       "Invalid index for I/O tensor: %d. Total I/O tensors: %d", index, migraphx_->numTensors());
     return nvinfer1::Dims{};
   }
-  return toDims(migraphx_->tensor(index).dims.value_or(std::vector<int64_t>{}));
+  return toDims(migraphx_->reportedDims(index).value_or(std::vector<int64_t>{}));
 }
 
 nvinfer1::Dims TrtCommon::getTensorShape(const char * tensor_name) const
@@ -821,7 +915,7 @@ nvinfer1::Dims TrtCommon::getTensorShape(const char * tensor_name) const
   }
   // Dynamic dimensions stay -1, as in a TensorRT engine; a tensor the model gives no shape takes
   // the shape of the compiled program.
-  if (const auto & dims = migraphx_->tensor(*index).dims) {
+  if (const auto & dims = migraphx_->reportedDims(*index)) {
     return toDims(*dims);
   }
   for (const auto & binding : migraphx_->engine->bindings) {
@@ -881,7 +975,7 @@ nvinfer1::Dims TrtCommon::getOutputDims(const int32_t index) const
     logger_->log(nvinfer1::ILogger::Severity::kERROR, "Invalid index for output tensor: %d", index);
     return {};
   }
-  return toDims(migraphx_->model.outputs[index].dims.value_or(std::vector<int64_t>{}));
+  return toDims(migraphx_->output_dims[index].value_or(std::vector<int64_t>{}));
 }
 
 bool TrtCommon::setTensorAddress(const char * tensor_name, void * data)
@@ -1025,16 +1119,26 @@ bool TrtCommon::enqueueV3(cudaStream_t stream)
       nvinfer1::ILogger::Severity::kINFO,
       "Compiling the model for new input shapes (%s); each new shape is compiled once",
       shapes.c_str());
+    const auto has_zero_length = std::any_of(input_lens.begin(), input_lens.end(), [](auto & l) {
+      return std::find(l.begin(), l.end(), std::size_t{0}) != l.end();
+    });
+    // Outputs that are empty at these shapes need no memory, and MIGraphX leaves them out.
+    std::vector<bool> empty_outputs(state.model.outputs.size(), false);
+    if (has_zero_length) {
+      if (auto empty = emptyOutputs(state.model, input_lens, trt_config_->onnx_path)) {
+        empty_outputs = std::move(*empty);
+      }
+    }
     try {
       const ProgramBuilder builder{*trt_config_, state.model, nullptr, *logger_};
-      compiled = describeProgram(builder.compile(input_lens), state.model);
+      compiled = describeProgram(builder.compile(input_lens), state.model, empty_outputs);
+      state.forgetDimsThatDiffer(*compiled);
     } catch (const std::exception & e) {
       state.programs.erase(input_lens);
-      const auto has_zero_length = std::any_of(input_lens.begin(), input_lens.end(), [](auto & l) {
-        return std::find(l.begin(), l.end(), std::size_t{0}) != l.end();
-      });
       // Every output empty: TensorRT computes nothing for such a run either.
-      if (has_zero_length && outputsAreEmpty(state.model, input_lens, trt_config_->onnx_path)) {
+      if (has_zero_length && std::all_of(empty_outputs.begin(), empty_outputs.end(), [](bool b) {
+            return b;
+          })) {
         logger_->log(
           nvinfer1::ILogger::Severity::kINFO,
           "Every output is empty for these input shapes; nothing is run for them");
@@ -1176,6 +1280,7 @@ bool TrtCommon::buildEngineFromOnnx()
   state.empty_shapes.clear();
   state.programs[compiled->input_lens] = compiled;
   state.engine = compiled;
+  state.forgetDimsThatDiffer(*compiled);
   state.engine_profile = std::set<std::string>(profile_lines.begin(), profile_lines.end());
   return true;
 }
@@ -1231,6 +1336,7 @@ bool TrtCommon::loadEngine()
   state.empty_shapes.clear();
   state.programs[compiled->input_lens] = compiled;
   state.engine = compiled;
+  state.forgetDimsThatDiffer(*compiled);
   state.engine_profile = std::move(profile);
   return true;
 }

@@ -18,6 +18,12 @@
 #include <NvInfer.h>
 #include <sys/types.h>
 
+// TrtCommonConfig has a MIGraphX-only member, so the library and its users must agree on the
+// backend. NV_INFER_VERSION_H is defined by the real TensorRT headers only.
+#if defined(AUTOWARE_TENSORRT_COMMON_MIGRAPHX) && defined(NV_INFER_VERSION_H)
+#error "autoware_tensorrt_common was built with MIGraphX, but TensorRT headers are included"
+#endif
+
 #if (defined(_MSC_VER) or (defined(__GNUC__) and (7 <= __GNUC_MAJOR__)))
 #include <filesystem>
 namespace fs = ::std::filesystem;

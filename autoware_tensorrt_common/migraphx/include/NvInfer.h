@@ -20,7 +20,9 @@
 #ifndef NVINFER_H_
 #define NVINFER_H_
 
-#if defined(NV_INFER_H) || defined(NV_TENSORRT_MAJOR)
+// NV_INFER_H and NV_INFER_VERSION_H are the include guards of TensorRT's NvInfer.h and
+// NvInferVersion.h, which every TensorRT header includes.
+#if defined(NV_INFER_H) || defined(NV_INFER_VERSION_H)
 #error "TensorRT headers are included together with the MIGraphX build of autoware_tensorrt_common"
 #endif
 
@@ -38,6 +40,13 @@
 #ifndef cudaStream_t
 #define cudaStream_t hipStream_t
 #endif
+
+// The TensorRT API level these declarations follow (TensorRT 10, with 64-bit dimensions), for code
+// that prints or compares the TensorRT version. This is not a TensorRT version: no TensorRT is
+// used.
+#define NV_TENSORRT_MAJOR 10
+#define NV_TENSORRT_MINOR 0
+#define NV_TENSORRT_PATCH 0
 
 namespace nvinfer1
 {

@@ -13,28 +13,42 @@
 // limitations under the License.
 
 // A plugin library as migraphx_common_test loads it through `plugin_paths`: loading it registers
-// the MIGraphX operator AutowareTestFillSeven, which fills its output buffer with 7.
+// the MIGraphX operator AutowareTestFillSeven(input, output), which fills `output` with 7.
 
 #include <migraphx/migraphx.hpp>
 
 #include <hip/hip_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
+// A MIGraphX operator that runs on the GPU gets no output allocation from MIGraphX: the buffer
+// it writes is its last input, which it returns and declares as its output alias.
 struct FillSeven final : migraphx::experimental_custom_op_base
 {
   std::string name() const override { return "AutowareTestFillSeven"; }
 
   bool runs_on_offload_target() const override { return true; }
 
-  migraphx::shape compute_shape(migraphx::shapes inputs) const override { return inputs[0]; }
+  migraphx::shape compute_shape(migraphx::shapes inputs) const override
+  {
+    if (inputs.size() != 2) {
+      throw std::runtime_error("AutowareTestFillSeven takes an input and an output buffer");
+    }
+    return inputs.back();
+  }
 
-  // As every MIGraphX custom operator, it writes the buffer passed as its last argument.
+  std::vector<std::size_t> output_alias(migraphx::shapes inputs) const override
+  {
+    return {inputs.size() - 1};
+  }
+
   migraphx::argument compute(
     migraphx::context ctx, migraphx::shape, migraphx::arguments inputs) const override
   {

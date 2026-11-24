@@ -22,7 +22,8 @@
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
 
-#if defined(AUTOWARE_TENSORRT_COMMON_MIGRAPHX) && defined(NV_TENSORRT_MAJOR)
+// NV_INFER_VERSION_H is defined by the real TensorRT headers only.
+#if defined(AUTOWARE_TENSORRT_COMMON_MIGRAPHX) && defined(NV_INFER_VERSION_H)
 #error "autoware_tensorrt_common was built with MIGraphX, but TensorRT headers are included"
 #endif
 

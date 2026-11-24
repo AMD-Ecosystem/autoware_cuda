@@ -146,9 +146,12 @@ if(BUILD_TESTING)
       TIMEOUT 600
     )
     if(TARGET ${PROJECT_NAME}_migraphx_test)
+      # The test also calls MIGraphX itself, to tell which shapes it compiles and to run the
+      # plugin's operator.
       target_link_libraries(${PROJECT_NAME}_migraphx_test
         ${PROJECT_NAME}
         autoware_cuda_utils::autoware_cuda_utils
+        migraphx::c
       )
       # A plugin library as consumers pass in plugin_paths: it registers a MIGraphX operator.
       add_library(${PROJECT_NAME}_test_plugin MODULE test/custom_op_plugin.cpp)
