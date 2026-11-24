@@ -191,27 +191,35 @@ bool isStatic(const OnnxTensor & tensor)
 }
 
 /**
- * Output dimensions as reported: as the model declares them, and with static inputs the ones it
- * leaves symbolic filled in from `static_lens`, the output lengths MIGraphX infers for the only
- * input shapes there are. With a dynamic input every dimension the model leaves symbolic is -1,
- * including any that TensorRT would find to be constant.
+ * Output dimensions as reported: as the model declares them, with what it leaves out taken from
+ * `parsed`, the model as construction parsed it. With static inputs those are the only lengths
+ * there are, and they fill in every dimension the model leaves symbolic. With a dynamic input
+ * every such dimension is -1, including any that TensorRT would find to be constant, and an
+ * output the model gives no shape takes the rank of the parsed one with every dimension -1. Such an
+ * output stays nullopt only when the parse gives it no static shape, or gives another number of
+ * outputs.
  */
 std::vector<std::optional<std::vector<int64_t>>> outputDims(
-  const OnnxModelIO & model, const std::optional<std::vector<Lens>> & static_lens)
+  const OnnxModelIO & model, const migraphx::program & parsed, const bool has_dynamic_input)
 {
   std::vector<std::optional<std::vector<int64_t>>> dims;
   for (const auto & output : model.outputs) {
     dims.push_back(output.dims);
   }
-  if (!static_lens || static_lens->size() != model.outputs.size()) {
+  const auto shapes = parsed.get_output_shapes();
+  if (shapes.size() != dims.size()) {
     return dims;
   }
   for (std::size_t o = 0; o < dims.size(); ++o) {
-    const auto & lens = (*static_lens)[o];
+    if (shapes[o].dynamic()) {
+      continue;
+    }
+    const auto lens = shapes[o].lengths();
     auto & output = dims[o];
     if (!output) {
-      output = std::vector<int64_t>(lens.begin(), lens.end());
-    } else if (output->size() == lens.size()) {
+      output = has_dynamic_input ? std::vector<int64_t>(lens.size(), -1)
+                                 : std::vector<int64_t>(lens.begin(), lens.end());
+    } else if (!has_dynamic_input && output->size() == lens.size()) {
       for (std::size_t i = 0; i < lens.size(); ++i) {
         if ((*output)[i] < 0) {
           (*output)[i] = static_cast<int64_t>(lens[i]);
@@ -418,10 +426,8 @@ struct TrtCommon::MigraphxState
   //!< Inputs and outputs the ONNX model declares, in its order: the IO tensor indices.
   OnnxModelIO model;
   //!< Output dimensions as reported (`outputDims`). Every compiled program is checked against
-  //!< them, so a buffer sized from a reported dimension is never written past.
+  //!< them, rank included, so a buffer sized from a reported dimension is never written past.
   std::vector<std::optional<std::vector<int64_t>>> output_dims;
-  //!< Whether any input has a dimension the model leaves symbolic.
-  bool has_dynamic_input = false;
   //!< Size and hash of the ONNX file, recorded with a cached program.
   std::string model_fingerprint;
   //!< Device architecture the programs are compiled for.
@@ -571,7 +577,7 @@ bool TrtCommon::initialize()
       parse_error.c_str());
     return false;
   }
-  auto output_dims = outputDims(*model, has_dynamic_input ? std::nullopt : outputLens(*parsed));
+  auto output_dims = outputDims(*model, *parsed, has_dynamic_input);
 
   if (isStronglyTyped()) {
     logger_->log(
@@ -587,7 +593,6 @@ bool TrtCommon::initialize()
   migraphx_ = std::make_unique<MigraphxState>();
   migraphx_->model = std::move(*model);
   migraphx_->output_dims = std::move(output_dims);
-  migraphx_->has_dynamic_input = has_dynamic_input;
   migraphx_->model_fingerprint = *fingerprint;
   migraphx_->arch = *arch;
   migraphx_->addresses.assign(migraphx_->numTensors(), nullptr);
@@ -752,11 +757,13 @@ std::shared_ptr<CompiledProgram> describeProgram(
     }
     const auto is_input = index < static_cast<int32_t>(num_inputs);
     const auto & tensor = is_input ? model.inputs[index] : model.outputs[index - num_inputs];
-    if (!matchesDims(
-          shape.lengths(), is_input ? tensor.dims : output_dims.at(index - num_inputs))) {
+    const auto & expected = is_input ? tensor.dims : output_dims.at(index - num_inputs);
+    if (!matchesDims(shape.lengths(), expected)) {
       throw std::runtime_error(
-        "Compiled program has shape " + lensRepr(shape.lengths()) + " for tensor " + tensor.name +
-        ", which does not match the model");
+        "Compiled program has shape " + lensRepr(shape.lengths()) + " for " +
+        (is_input ? "input " : "output ") + tensor.name + ", which does not match its dimensions " +
+        TensorInfo::dimsRepr(toDims(*expected)) +
+        (is_input ? " in the model" : " as reported for the model"));
     }
     compiled->bindings.push_back({parameter, index, shape});
   }
@@ -827,8 +834,21 @@ bool TrtCommon::setup(ProfileDimsPtr profile_dims, NetworkIOPtr network_io)
     }
   }
 
-  // Listed here, before inference starts, because listing them redirects std::cout. Operations
-  // MIGraphX brings in only at other input shapes stay fp32 in the programs compiled for those.
+  // A program is checked against the reported rank of every output, so each needs one.
+  for (std::size_t o = 0; o < migraphx_->output_dims.size(); ++o) {
+    if (!migraphx_->output_dims[o]) {
+      logger_->log(
+        nvinfer1::ILogger::Severity::kERROR,
+        "The model gives output %s no shape, and MIGraphX gives it no rank either",
+        migraphx_->model.outputs[o].name.c_str());
+      return false;
+    }
+  }
+
+  // Listed here, before inference starts, because listing them redirects std::cout; this reads
+  // the model also when the cached program is loaded. Operations MIGraphX brings in only at other
+  // input shapes stay fp32 in the programs compiled for those. Without the list a cached program
+  // still loads and runs, but nothing can be compiled.
   migraphx_->fp16_operations.reset();
   if (trt_config_->precision == "fp16" && !trt_config_->fp16_excluded_ops.empty()) {
     try {
@@ -837,9 +857,10 @@ bool TrtCommon::setup(ProfileDimsPtr profile_dims, NetworkIOPtr network_io)
         *logger_);
     } catch (const std::exception & e) {
       logger_->log(
-        nvinfer1::ILogger::Severity::kERROR, "Fail to list the operations of the model: %s",
+        nvinfer1::ILogger::Severity::kWARNING,
+        "Fail to list the operations of the model, so it cannot be compiled with "
+        "fp16_excluded_ops: %s",
         e.what());
-      return false;
     }
   }
 
@@ -952,16 +973,15 @@ nvinfer1::Dims TrtCommon::getTensorShape(const char * tensor_name) const
   if (!index) {
     return nvinfer1::Dims{-1, {}};
   }
-  // Dynamic dimensions stay -1, as in a TensorRT engine. A tensor the model gives no shape takes
-  // the rank of the compiled program, and its lengths only when every input is static.
+  // Dynamic dimensions stay -1, as in a TensorRT engine. Every output has reported dimensions once
+  // setup() has succeeded; an input the model gives no shape is dynamic and takes the rank of the
+  // compiled program.
   if (const auto & dims = migraphx_->reportedDims(*index)) {
     return toDims(*dims);
   }
   for (const auto & binding : migraphx_->engine->bindings) {
     if (binding.index == *index) {
-      const auto lens = binding.shape.lengths();
-      return migraphx_->has_dynamic_input ? toDims(std::vector<int64_t>(lens.size(), -1))
-                                          : toDims(lens);
+      return toDims(std::vector<int64_t>(binding.shape.lengths().size(), -1));
     }
   }
   return nvinfer1::Dims{-1, {}};

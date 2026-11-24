@@ -33,6 +33,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -403,7 +404,7 @@ TEST_F(MigraphxCommonTest, Fp16InferenceIsCloseToFp32)
   EXPECT_NE(programFiles().front().filename().string().find(".fp16.mxr"), std::string::npos);
 
   // Excluding every computing operation keeps fp32 accuracy, also in the program enqueueV3()
-  // compiles for a new batch size with the operations setup() listed.
+  // compiles for a new batch size.
   TrtCommonConfig config(
     (kDataDir / "conv_network.onnx").string(), "fp16", enginePath("fp16_excluded"), 1ULL << 26U);
   config.fp16_excluded_ops = {"add", "convolution", "dot", "pooling", "relu"};
@@ -765,6 +766,32 @@ TEST_F(MigraphxCommonTest, Fp16ExclusionsApplyToTheOptimizedProgram)
   EXPECT_LT(kept, 1e-5F);
 }
 
+TEST_F(MigraphxCommonTest, Fp16ExclusionsDoNotStopACachedProgramFromLoading)
+{
+  // setup() lists the operations to convert by reading the model, also when the program is cached.
+  // If that fails (here the model is gone after construction), the cached program still loads and
+  // runs; without a cached program, setup() fails.
+  const auto dir = work_dir_ / "listing";
+  const auto model = dir / "model.onnx";
+  placeModel("conv_network.onnx", model);
+  const auto make = [&]() {
+    TrtCommonConfig config(model.string(), "fp16", (dir / "model.engine").string(), 1ULL << 26U);
+    config.fp16_excluded_ops = {"relu"};
+    return std::make_unique<TrtCommon>(config);
+  };
+  {
+    auto trt = make();
+    ASSERT_TRUE(setupConv(*trt));
+  }
+  auto cached = make();
+  auto uncached = make();
+  std::filesystem::remove(model);
+  ASSERT_TRUE(setupConv(*cached));
+  EXPECT_LT(runConv(*cached, 8), 1e-2F);
+  std::filesystem::remove(programIn(dir));
+  EXPECT_FALSE(setupConv(*uncached));
+}
+
 namespace
 {
 /// Protobuf encoding, enough to write an ONNX model.
@@ -1031,6 +1058,153 @@ TEST_F(MigraphxCommonTest, OutputDimsFollowingADynamicOneAreDynamicAndNeverWritt
     EXPECT_TRUE(run(*trt, height, (height - 1) / 300 + 1)) << "height " << height;
     expectDims(trt->getTensorShape("halved"), {1, 2, -1, 4});
     expectDims(trt->getTensorShape("sparse"), {1, 2, -1, 8});
+  }
+}
+
+namespace
+{
+// Profile of x [rows, 4] in the rows models: 1 to 64 rows, optimum 8.
+std::unique_ptr<std::vector<ProfileDims>> rowsProfile()
+{
+  return std::make_unique<std::vector<ProfileDims>>(
+    std::vector<ProfileDims>{ProfileDims("x", {2, {1, 4}}, {2, {8, 4}}, {2, {64, 4}})});
+}
+}  // namespace
+
+TEST_F(MigraphxCommonTest, OutputWithNoShapeInTheModelHasItsRankAndIsNeverWrittenPast)
+{
+  // shapeless_output.onnx: x [rows, 4] -> y = relu(x), which the model gives no shape. As TensorRT
+  // does, its rank is reported, with every dimension -1 since rows is dynamic, before and after
+  // setup(). A buffer sized from getOutputDims(), each -1 taken as the length the caller knows for
+  // that dimension, holds what a run writes.
+  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
+    (kDataDir / "shapeless_output.onnx").string(), "fp32", enginePath("shapeless"), 1ULL << 26U));
+  expectDims(trt->getOutputDims(0), {-1, -1});
+  expectDims(trt->getTensorShape(1), {-1, -1});
+  ASSERT_TRUE(trt->setup(rowsProfile(), nullptr));
+  expectDims(trt->getOutputDims(0), {-1, -1});
+  expectDims(trt->getTensorShape(1), {-1, -1});
+  expectDims(trt->getTensorShape("y"), {-1, -1});
+
+  static constexpr std::size_t kGuard = 1024;
+  static constexpr float kSentinel = -12345.0F;
+  for (const int64_t rows : std::vector<int64_t>{64, 8, 3}) {
+    const std::vector<int64_t> known{rows, 4};
+    const auto reported = trt->getOutputDims(0);
+    std::size_t size = 1;
+    for (int32_t i = 0; i < reported.nbDims; ++i) {
+      size *= static_cast<std::size_t>(reported.d[i] < 0 ? known.at(i) : reported.d[i]);
+    }
+    std::vector<float> x(rows * 4);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      x[i] = inputValue(i);
+    }
+    DeviceBuffer x_d(x.size());
+    DeviceBuffer y_d(size + kGuard);
+    x_d.upload(x);
+    y_d.upload(std::vector<float>(size + kGuard, kSentinel));
+    EXPECT_TRUE(trt->setTensor("x", x_d.get(), {2, {rows, 4}}));
+    EXPECT_TRUE(trt->setTensorAddress("y", y_d.get()));
+    EXPECT_TRUE(trt->enqueueV3(stream_)) << "rows " << rows;
+    EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+    const auto y = y_d.download();
+    EXPECT_TRUE(
+      std::all_of(
+        y.begin() + static_cast<std::ptrdiff_t>(size), y.end(),
+        [](float v) { return v == kSentinel; }))
+      << "a run at " << rows << " rows wrote past a buffer sized from the reported shape";
+    ASSERT_EQ(size, x.size()) << "rows " << rows;
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      EXPECT_EQ(y[i], std::max(x[i], 0.0F)) << "rows " << rows << ", element " << i;
+    }
+  }
+}
+
+TEST_F(MigraphxCommonTest, OutputRankThatDependsOnTheInputShapesIsRefused)
+{
+  // squeezed.onnx: y = Squeeze(x) with no axes, which the model gives no shape. Parsed with one
+  // row, as when it is constructed, y has rank 1 and is reported so; the program compiled for the
+  // profile's 8 rows gives it rank 2, so setup() fails rather than run with a rank other than the
+  // one reported. With an optimum of one row setup() succeeds, and a run at 8 rows is refused.
+  // TensorRT refuses this model when it parses it.
+  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
+    (kDataDir / "squeezed.onnx").string(), "fp32", enginePath("squeezed"), 1ULL << 26U));
+  expectDims(trt->getOutputDims(0), {-1});
+  EXPECT_FALSE(trt->setup(rowsProfile(), nullptr));
+
+  auto one_row = std::make_unique<TrtCommon>(TrtCommonConfig(
+    (kDataDir / "squeezed.onnx").string(), "fp32", enginePath("squeezed_one_row"), 1ULL << 26U));
+  ASSERT_TRUE(one_row->setup(
+    std::make_unique<std::vector<ProfileDims>>(
+      std::vector<ProfileDims>{ProfileDims("x", {2, {1, 4}}, {2, {1, 4}}, {2, {64, 4}})}),
+    nullptr));
+  DeviceBuffer x_d(8 * 4);
+  DeviceBuffer y_d(8 * 4);
+  x_d.upload(std::vector<float>(8 * 4, 1.0F));
+  EXPECT_TRUE(one_row->setTensor("x", x_d.get(), {2, {8, 4}}));
+  EXPECT_TRUE(one_row->setTensorAddress("y", y_d.get()));
+  EXPECT_FALSE(one_row->enqueueV3(stream_));
+}
+
+TEST_F(MigraphxCommonTest, CachedProgramWithOtherOutputDimsIsRebuilt)
+{
+  // A program whose output has another rank, or another length where one is reported, cached
+  // under a key that claims this model: loading checks its outputs against the reported dimensions
+  // and rebuilds.
+  const auto replace_program = [&](
+                                 const std::filesystem::path & dir, const std::string & other,
+                                 const std::function<bool(TrtCommon &)> & setup) {
+    const auto other_dir = dir.string() + "_other";
+    placeModel(other, std::filesystem::path(other_dir) / "model.onnx");
+    {
+      auto trt = makeAt(other_dir, std::filesystem::path(other_dir) / "model.onnx");
+      ASSERT_TRUE(setup(*trt)) << other;
+    }
+    const auto program = programIn(dir);
+    std::filesystem::copy_file(
+      programIn(other_dir), program, std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::last_write_time(
+      program, std::filesystem::last_write_time(program) - std::chrono::hours(1));
+  };
+
+  // y [rows, 4], reported [-1, -1], against a program giving y [rows * 4].
+  {
+    const auto dir = work_dir_ / "rank";
+    placeModel("shapeless_output.onnx", dir / "model.onnx");
+    const auto setup = [](TrtCommon & trt) { return trt.setup(rowsProfile(), nullptr); };
+    {
+      auto trt = makeAt(dir, dir / "model.onnx");
+      ASSERT_TRUE(setup(*trt));
+    }
+    replace_program(dir, "shapeless_output_flat.onnx", setup);
+    const auto before = std::filesystem::last_write_time(programIn(dir));
+    auto trt = makeAt(dir, dir / "model.onnx");
+    ASSERT_TRUE(setup(*trt));
+    EXPECT_GT(std::filesystem::last_write_time(programIn(dir)), before)
+      << "a program with another output rank was run";
+  }
+  // logits [batch, 2] against a program giving logits [batch, 3].
+  {
+    const auto dir = work_dir_ / "length";
+    placeModel("conv_network.onnx", dir / "model.onnx");
+    const auto setup = [](TrtCommon & trt) { return setupConv(trt); };
+    {
+      auto trt = makeAt(dir, dir / "model.onnx");
+      ASSERT_TRUE(setup(*trt));
+    }
+    replace_program(dir, "conv_network_three_classes.onnx", [](TrtCommon & trt) {
+      return trt.setup(
+        std::make_unique<std::vector<ProfileDims>>(convProfile()),
+        std::make_unique<std::vector<NetworkIO>>(std::vector<NetworkIO>{
+          NetworkIO("image", imageDims(-1)), NetworkIO("logits", {2, {-1, 3}}),
+          NetworkIO("features", {2, {-1, kFeatures}})}));
+    });
+    const auto before = std::filesystem::last_write_time(programIn(dir));
+    auto trt = makeAt(dir, dir / "model.onnx");
+    ASSERT_TRUE(setup(*trt));
+    EXPECT_GT(std::filesystem::last_write_time(programIn(dir)), before)
+      << "a program with another output length was run";
+    EXPECT_LT(runConv(*trt, 8), 1e-5F);
   }
 }
 

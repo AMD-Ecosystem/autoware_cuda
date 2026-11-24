@@ -4,12 +4,13 @@
 conv_network.onnx is a small classifier with a dynamic batch: a 3x3 convolution, ReLU, global
 average pooling and a fully connected layer. It returns two outputs, `logits` and then `features`,
 so the order of the outputs is observable. Variants of it check that a cached program is rebuilt
-when the model changes (other weights, a renamed input, another input size) and that output
-dimensions the model leaves symbolic are reported once known; pool_network.onnx has output
-dimensions that follow a dynamic one through a floor division. activations.onnx and
-scaled_sigmoid.onnx check that operations can be kept out of fp16, rows_scaled.onnx and rows.onnx
-take inputs with no rows, and custom_op_network.onnx calls an operator that a plugin library
-registers. Each reference file holds the float32 outputs for the input the test builds (see
+when the model changes (other weights, a renamed input, another input size or class count) and
+that output dimensions the model leaves symbolic are reported once known; pool_network.onnx has
+output dimensions that follow a dynamic one through a floor division, and shapeless_output.onnx,
+shapeless_output_flat.onnx and squeezed.onnx an output the model gives no shape. activations.onnx
+and scaled_sigmoid.onnx check that operations can be kept out of fp16, rows_scaled.onnx and
+rows.onnx take inputs with no rows, and custom_op_network.onnx calls an operator that a plugin
+library registers. Each reference file holds the float32 outputs for the input the test builds (see
 `inputValue` in the test), computed here with numpy.
 
 Writes the files next to this script, so it can be run from anywhere.
@@ -53,12 +54,12 @@ def save_reference(outputs, name):
     reference.tofile(str(here.with_name(name)))
 
 
-def conv_weights(seed):
+def conv_weights(seed, classes=CLASSES):
     rng = np.random.default_rng(seed)
     weight = rng.uniform(-0.5, 0.5, (FILTERS, CHANNELS, 3, 3)).astype(np.float32)
     bias = rng.uniform(-0.1, 0.1, (FILTERS,)).astype(np.float32)
-    fc_weight = rng.uniform(-1.0, 1.0, (FILTERS, CLASSES)).astype(np.float32)
-    fc_bias = rng.uniform(-0.1, 0.1, (CLASSES,)).astype(np.float32)
+    fc_weight = rng.uniform(-1.0, 1.0, (FILTERS, classes)).astype(np.float32)
+    fc_bias = rng.uniform(-0.1, 0.1, (classes,)).astype(np.float32)
     return weight, bias, fc_weight, fc_bias
 
 
@@ -70,8 +71,9 @@ def conv_network(
     batch=BATCH,
     logits_dims=(BATCH, CLASSES),
     features_dims=(BATCH, FILTERS),
+    classes=CLASSES,
 ):
-    weight, bias, fc_weight, fc_bias = conv_weights(seed)
+    weight, bias, fc_weight, fc_bias = conv_weights(seed, classes)
     graph = helper.make_graph(
         nodes=[
             helper.make_node("Conv", [input_name, "weight", "bias"], ["conv"], pads=[1, 1, 1, 1]),
@@ -128,6 +130,8 @@ conv_network("conv_network_renamed.onnx", input_name="pixels")
 # A 16x16 input.
 conv_network("conv_network_resized.onnx", size=16)
 conv_reference("conv_network_resized_reference.bin", size=16)
+# Three classes.
+conv_network("conv_network_three_classes.onnx", logits_dims=(BATCH, 3), classes=3)
 # Output dimensions left symbolic, with a static input and with a dynamic batch.
 conv_network(
     "conv_network_static_symbolic.onnx",
@@ -251,10 +255,34 @@ for name, nodes, inputs, outputs, initializers in (
     model.ir_version = 9
     save(model, name)
 
+# Outputs the model gives no shape, of x [rows, 4]: its ReLU, the same flattened to [rows * 4],
+# and Squeeze with no axes, which drops the rows dimension only when there is one row. The ONNX
+# checker requires a shape for graph outputs, so these are saved unchecked.
+for name, nodes, initializers in (
+    ("shapeless_output.onnx", [helper.make_node("Relu", ["x"], ["y"])], []),
+    (
+        "shapeless_output_flat.onnx",
+        [helper.make_node("Reshape", ["x", "flat"], ["y"])],
+        [numpy_helper.from_array(np.array([-1], np.int64), "flat")],
+    ),
+    ("squeezed.onnx", [helper.make_node("Squeeze", ["x"], ["y"])], []),
+):
+    graph = helper.make_graph(
+        nodes,
+        "shapeless_output",
+        [row_input],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
+        initializer=initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 9
+    onnx.save(model, str(here.with_name(name)))
+
 # y = AutowareTestFillSeven(x, buffer) + x = x + 7, where the test plugin library registers the
-# operator. Like a MIGraphX custom operator that runs on the GPU, it writes its result into the
-# buffer passed as its last input. The `buffer` graph input exists only because nothing in an ONNX
-# graph can supply that allocation; a model written for a TensorRT plugin has no such input.
+# operator. As a MIGraphX custom operator that runs on the GPU must, it writes its result into
+# one of its inputs, here the buffer passed last. The `buffer` graph input exists only because
+# nothing in an ONNX graph can supply that allocation; a model written for a TensorRT plugin has no
+# such input.
 custom = helper.make_graph(
     nodes=[
         helper.make_node("AutowareTestFillSeven", ["x", "buffer"], ["sevens"]),
