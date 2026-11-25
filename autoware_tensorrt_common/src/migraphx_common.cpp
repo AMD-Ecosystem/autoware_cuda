@@ -13,7 +13,11 @@
 // limitations under the License.
 
 // TrtCommon on AMD GPUs: the ONNX model is compiled and run with MIGraphX. A compiled program
-// takes the place of the TensorRT engine and is cached on disk next to the engine path.
+// takes the place of the TensorRT engine and is cached on disk next to the engine path. Every
+// output must have a shape in the model with at least one dimension, which MIGraphX keeps: MIGraphX
+// gives a scalar one element in one dimension and does not always give an output the rank the
+// model computes, so the constructor refuses a model with a scalar output, an output with no shape
+// or one that MIGraphX reads with another rank, naming the output.
 
 #include "autoware/tensorrt_common/logger.hpp"
 #include "autoware/tensorrt_common/tensorrt_common.hpp"
@@ -190,57 +194,51 @@ bool isStatic(const OnnxTensor & tensor)
          std::all_of(tensor.dims->begin(), tensor.dims->end(), [](auto d) { return d >= 0; });
 }
 
-/// Static output lengths of a parsed program, nullopt for an output that has none, or no entries
-/// when the program has another number of outputs than the model.
-std::vector<std::optional<Lens>> parsedOutputLens(
-  const OnnxModelIO & model, const migraphx::program & parsed)
+/**
+ * Why the backend does not support an output, or nullopt when it does, judged from the model
+ * alone. The rank of an output is taken from the shape the model declares for it: MIGraphX gives
+ * a scalar one element in one dimension, and the rank it gives an output is not always the
+ * model's (the Unsqueeze of a scalar, for example, keeps one dimension), so neither a scalar
+ * output nor an output with no shape in the model could be reported with its real rank.
+ */
+std::optional<std::string> unsupportedOutput(const OnnxTensor & output)
 {
-  const auto shapes = parsed.get_output_shapes();
-  if (shapes.size() != model.outputs.size()) {
-    return {};
+  if (!output.dims) {
+    return "the model gives it no shape";
   }
-  std::vector<std::optional<Lens>> lens;
-  for (std::size_t o = 0; o < shapes.size(); ++o) {
-    lens.push_back(shapes[o].dynamic() ? std::nullopt : std::optional<Lens>(shapes[o].lengths()));
+  if (output.dims->empty()) {
+    return "it is a scalar (rank 0)";
   }
-  return lens;
+  return std::nullopt;
 }
 
 /**
- * Output dimensions as reported, nullopt for an output whose rank cannot be told. An output the
- * model gives a shape keeps it, rank 0 for a scalar. Its symbolic dimensions are taken from
- * `parsed`, the model as construction parsed it, when every input is static: those are then the
- * only lengths there are. With a dynamic input every such dimension is -1, including any that
- * TensorRT would find to be constant. An output the model gives no shape takes the rank inferred
- * from the graph (`OnnxTensor::rank`), else the rank of the parsed output, with its dimensions
- * found the same way. MIGraphX gives a scalar one element in one dimension, so a parsed output of
- * one element does not tell its rank.
+ * Output dimensions as reported: as the model declares them. When every input is static, the
+ * dimensions the model leaves symbolic are taken from `parsed`, the model as construction parsed
+ * it: those are then the only lengths there are. With a dynamic input every such dimension is -1,
+ * including any that TensorRT would find to be constant.
  */
-std::vector<std::optional<std::vector<int64_t>>> outputDims(
-  const OnnxModelIO & model, const std::vector<std::optional<Lens>> & parsed,
-  const bool has_dynamic_input)
+std::vector<std::vector<int64_t>> outputDims(
+  const OnnxModelIO & model, const migraphx::program & parsed, const bool has_dynamic_input)
 {
-  std::vector<std::optional<std::vector<int64_t>>> dims;
-  for (std::size_t o = 0; o < model.outputs.size(); ++o) {
-    const auto & output = model.outputs[o];
-    const auto & lens = o < parsed.size() ? parsed[o] : std::nullopt;
-    auto rank = output.dims ? std::optional<std::size_t>(output.dims->size()) : output.rank;
-    if (!rank && lens && *lens != Lens{1}) {
-      rank = lens->size();
-    }
-    if (!rank) {
-      dims.emplace_back();
+  std::vector<std::vector<int64_t>> dims;
+  for (const auto & output : model.outputs) {
+    dims.push_back(*output.dims);
+  }
+  const auto shapes = parsed.get_output_shapes();
+  if (has_dynamic_input || shapes.size() != dims.size()) {
+    return dims;
+  }
+  for (std::size_t o = 0; o < dims.size(); ++o) {
+    if (shapes[o].dynamic()) {
       continue;
     }
-    auto reported = output.dims.value_or(std::vector<int64_t>(*rank, -1));
-    if (!has_dynamic_input && lens && lens->size() == reported.size()) {
-      for (std::size_t i = 0; i < lens->size(); ++i) {
-        if (reported[i] < 0) {
-          reported[i] = static_cast<int64_t>((*lens)[i]);
-        }
+    const auto lens = shapes[o].lengths();
+    for (std::size_t i = 0; i < lens.size(); ++i) {
+      if (dims[o][i] < 0) {
+        dims[o][i] = static_cast<int64_t>(lens[i]);
       }
     }
-    dims.emplace_back(std::move(reported));
   }
   return dims;
 }
@@ -558,13 +556,23 @@ bool TrtCommon::initialize()
     return false;
   }
 
+  for (const auto & output : model->outputs) {
+    if (const auto reason = unsupportedOutput(output)) {
+      logger_->log(
+        nvinfer1::ILogger::Severity::kERROR,
+        "Output %s is not supported by the MIGraphX backend: %s. The MIGraphX backend supports "
+        "only outputs whose shape the model declares, with at least one dimension",
+        output.name.c_str(), reason->c_str());
+      return false;
+    }
+  }
+
   // Parse once so that a model MIGraphX cannot read fails here, as it does with TensorRT. MIGraphX
   // gives dynamic dimensions the length 1, which not every model accepts, so other lengths are
   // tried for a model with dynamic inputs.
   const auto has_dynamic_input = !std::all_of(model->inputs.begin(), model->inputs.end(), isStatic);
   std::optional<migraphx::program> parsed;
   std::string parse_error;
-  unsigned int parsed_length = 1U;
   for (std::size_t attempt = 0; !parsed && attempt <= kFallbackParseLengths.size(); ++attempt) {
     try {
       migraphx::onnx_options options;
@@ -576,7 +584,6 @@ bool TrtCommon::initialize()
           trt_config_->onnx_path.c_str(), attempt == 1 ? 1U : kFallbackParseLengths[attempt - 2],
           kFallbackParseLengths[attempt - 1]);
         options.set_default_dim_value(kFallbackParseLengths[attempt - 1]);
-        parsed_length = kFallbackParseLengths[attempt - 1];
       }
       parsed = migraphx::parse_onnx(trt_config_->onnx_path.c_str(), options);
     } catch (const std::exception & e) {
@@ -594,45 +601,22 @@ bool TrtCommon::initialize()
       parse_error.c_str());
     return false;
   }
-  const auto parsed_lens = parsedOutputLens(*model, *parsed);
-  auto output_dims = outputDims(*model, parsed_lens, has_dynamic_input);
-
-  // A scalar has one element at any input shapes, so an output with more elements at other
-  // lengths of the dynamic dimensions is not one.
-  const auto is_unknown = [](const auto & dims) { return !dims.has_value(); };
-  if (has_dynamic_input && std::any_of(output_dims.begin(), output_dims.end(), is_unknown)) {
-    try {
-      migraphx::onnx_options options;
-      options.set_default_dim_value(
-        parsed_length == kFallbackParseLengths.front() ? kFallbackParseLengths.back()
-                                                       : kFallbackParseLengths.front());
-      const auto other = outputDims(
-        *model,
-        parsedOutputLens(*model, migraphx::parse_onnx(trt_config_->onnx_path.c_str(), options)),
-        has_dynamic_input);
-      for (std::size_t o = 0; o < output_dims.size(); ++o) {
-        if (!output_dims[o]) {
-          output_dims[o] = other[o];
-        }
+  // A program that gives an output another rank than the model could not be run.
+  const auto parsed_shapes = parsed->get_output_shapes();
+  if (parsed_shapes.size() == model->outputs.size()) {
+    for (std::size_t o = 0; o < parsed_shapes.size(); ++o) {
+      const auto & output = model->outputs[o];
+      if (!parsed_shapes[o].dynamic() && parsed_shapes[o].lengths().size() != output.dims->size()) {
+        logger_->log(
+          nvinfer1::ILogger::Severity::kERROR,
+          "Output %s is not supported by the MIGraphX backend: it has %zu dimensions in the "
+          "model, but MIGraphX reads it as %s",
+          output.name.c_str(), output.dims->size(), lensRepr(parsed_shapes[o].lengths()).c_str());
+        return false;
       }
-    } catch (const std::exception &) {
-      // The rank stays unknown.
     }
   }
-  std::vector<std::vector<int64_t>> reported_dims;
-  for (std::size_t o = 0; o < output_dims.size(); ++o) {
-    if (!output_dims[o]) {
-      const auto one_element = o < parsed_lens.size() && parsed_lens[o] == Lens{1};
-      logger_->log(
-        nvinfer1::ILogger::Severity::kERROR,
-        "Cannot tell the rank of output %s: the model gives it no shape, its rank does not follow "
-        "from the graph, and MIGraphX gives it %s. Give the output its shape in the model",
-        model->outputs[o].name.c_str(),
-        one_element ? "one element, as it does a scalar" : "no static shape");
-      return false;
-    }
-    reported_dims.push_back(std::move(*output_dims[o]));
-  }
+  auto output_dims = outputDims(*model, *parsed, has_dynamic_input);
 
   if (isStronglyTyped()) {
     logger_->log(
@@ -647,7 +631,7 @@ bool TrtCommon::initialize()
 
   migraphx_ = std::make_unique<MigraphxState>();
   migraphx_->model = std::move(*model);
-  migraphx_->output_dims = std::move(reported_dims);
+  migraphx_->output_dims = std::move(output_dims);
   migraphx_->model_fingerprint = *fingerprint;
   migraphx_->arch = *arch;
   migraphx_->addresses.assign(migraphx_->numTensors(), nullptr);
@@ -759,7 +743,7 @@ struct ProgramBuilder
 };
 
 /// Whether compiled lengths agree with the dimensions of a tensor, -1 for any length. MIGraphX
-/// gives a scalar one element in one dimension.
+/// gives a scalar input one element in one dimension.
 bool matchesDims(const Lens & lens, const std::optional<std::vector<int64_t>> & expected)
 {
   if (!expected) {

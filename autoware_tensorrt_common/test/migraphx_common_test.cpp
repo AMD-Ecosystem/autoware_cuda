@@ -38,7 +38,6 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
-#include <map>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -1127,50 +1126,60 @@ std::unique_ptr<std::vector<ProfileDims>> rowsProfile()
 }
 }  // namespace
 
-TEST_F(MigraphxCommonTest, OutputWithNoShapeInTheModelHasItsRankAndIsNeverWrittenPast)
+TEST_F(MigraphxCommonTest, OutputsWhoseRankMigraphxCannotKeepAreRefused)
 {
-  // shapeless_output.onnx: x [rows, 4] -> y = relu(x), which the model gives no shape. As TensorRT
-  // does, its rank is reported, with every dimension -1 since rows is dynamic, before and after
-  // setup(). A buffer sized from getOutputDims(), each -1 taken as the length the caller knows for
-  // that dimension, holds what a run writes.
-  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
-    (kDataDir / "shapeless_output.onnx").string(), "fp32", enginePath("shapeless"), 1ULL << 26U));
-  expectDims(trt->getOutputDims(0), {-1, -1});
-  expectDims(trt->getTensorShape(1), {-1, -1});
-  ASSERT_TRUE(trt->setup(rowsProfile(), nullptr));
-  expectDims(trt->getOutputDims(0), {-1, -1});
-  expectDims(trt->getTensorShape(1), {-1, -1});
-  expectDims(trt->getTensorShape("y"), {-1, -1});
-
-  for (const int64_t rows : std::vector<int64_t>{64, 8, 3}) {
-    expectRelu(runRows(*trt, rows, {rows, 4}), rows);
+  // MIGraphX gives a scalar one element in one dimension, and does not always give an output the
+  // rank the model computes, so the constructor refuses a model with an output that is a scalar,
+  // that the model gives no shape, or that MIGraphX reads with another rank, and logs why.
+  const std::vector<std::pair<std::string, std::string>> cases{
+    {"scalar_sum", "it is a scalar (rank 0)"},
+    {"scalar_sum_static", "it is a scalar (rank 0)"},
+    {"scalar_sum_shapeless", "the model gives it no shape"},
+    {"scalar_sum_shapeless_static", "the model gives it no shape"},
+    {"shapeless_output", "the model gives it no shape"},
+    {"squeezed", "the model gives it no shape"},
+    {"unsqueezed_scalar", "the model gives it no shape"},
+    {"unsqueezed_scalar_declared",
+     "it has 2 dimensions in the model, but MIGraphX reads it as [1]"},
+  };
+  for (const auto & [name, reason] : cases) {
+    ::testing::internal::CaptureStderr();
+    EXPECT_THROW(
+      TrtCommon(TrtCommonConfig(
+        (kDataDir / (name + ".onnx")).string(), "fp32", enginePath(name), 1ULL << 26U)),
+      std::runtime_error)
+      << name;
+    const auto log = ::testing::internal::GetCapturedStderr();
+    EXPECT_NE(
+      log.find("Output y is not supported by the MIGraphX backend: " + reason), std::string::npos)
+      << name << " logged:\n"
+      << log;
   }
 }
 
-TEST_F(MigraphxCommonTest, OutputRankThatDependsOnTheInputShapesIsRefused)
+TEST_F(MigraphxCommonTest, OneElementOutputKeepsTheRankTheModelDeclares)
 {
-  // squeezed.onnx: y = Squeeze(x) with no axes, which the model gives no shape. Parsed with one
-  // row, as when it is constructed, y has rank 1 and is reported so; the program compiled for the
-  // profile's 8 rows gives it rank 2, so setup() fails rather than run with a rank other than the
-  // one reported. With an optimum of one row setup() succeeds, and a run at 8 rows is refused.
-  // TensorRT refuses this model when it parses it.
+  // row_sums.onnx: y = the row sums of x [rows, 4], declared [rows]. With one row MIGraphX gives y
+  // one element in one dimension, as it gives a scalar. y is reported as [-1] before and after
+  // setup(), and a buffer sized from that, -1 taken as the number of rows, holds what a run
+  // writes, also with one row.
   auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
-    (kDataDir / "squeezed.onnx").string(), "fp32", enginePath("squeezed"), 1ULL << 26U));
+    (kDataDir / "row_sums.onnx").string(), "fp32", enginePath("row_sums"), 1ULL << 26U));
   expectDims(trt->getOutputDims(0), {-1});
-  EXPECT_FALSE(trt->setup(rowsProfile(), nullptr));
-
-  auto one_row = std::make_unique<TrtCommon>(TrtCommonConfig(
-    (kDataDir / "squeezed.onnx").string(), "fp32", enginePath("squeezed_one_row"), 1ULL << 26U));
-  ASSERT_TRUE(one_row->setup(
-    std::make_unique<std::vector<ProfileDims>>(
-      std::vector<ProfileDims>{ProfileDims("x", {2, {1, 4}}, {2, {1, 4}}, {2, {64, 4}})}),
-    nullptr));
-  DeviceBuffer x_d(8 * 4);
-  DeviceBuffer y_d(8 * 4);
-  x_d.upload(std::vector<float>(8 * 4, 1.0F));
-  EXPECT_TRUE(one_row->setTensor("x", x_d.get(), {2, {8, 4}}));
-  EXPECT_TRUE(one_row->setTensorAddress("y", y_d.get()));
-  EXPECT_FALSE(one_row->enqueueV3(stream_));
+  ASSERT_TRUE(trt->setup(rowsProfile(), nullptr));
+  expectDims(trt->getOutputDims(0), {-1});
+  expectDims(trt->getTensorShape("y"), {-1});
+  for (const int64_t rows : std::vector<int64_t>{64, 8, 1}) {
+    const auto y = runRows(*trt, rows, {rows});
+    ASSERT_EQ(y.size(), static_cast<std::size_t>(rows));
+    for (int64_t r = 0; r < rows; ++r) {
+      float sum = 0.0F;
+      for (int64_t c = 0; c < 4; ++c) {
+        sum += inputValue(r * 4 + c);
+      }
+      EXPECT_NEAR(y[r], sum, 1e-5) << "rows " << rows << ", row " << r;
+    }
+  }
 }
 
 TEST_F(MigraphxCommonTest, CachedProgramWithOtherOutputDimsIsRebuilt)
@@ -1194,16 +1203,17 @@ TEST_F(MigraphxCommonTest, CachedProgramWithOtherOutputDimsIsRebuilt)
       program, std::filesystem::last_write_time(program) - std::chrono::hours(1));
   };
 
-  // y [rows, 4], reported [-1, -1], against a program giving y [rows * 4].
+  // y [rows, 4], reported [-1, 4], against a program giving y [rows * 4], which holds x itself, so
+  // a run of that program would also fail the ReLU check.
   {
     const auto dir = work_dir_ / "rank";
-    placeModel("shapeless_output.onnx", dir / "model.onnx");
+    placeModel("rows_relu.onnx", dir / "model.onnx");
     const auto setup = [](TrtCommon & trt) { return trt.setup(rowsProfile(), nullptr); };
     {
       auto trt = makeAt(dir, dir / "model.onnx");
       ASSERT_TRUE(setup(*trt));
     }
-    replace_program(dir, "shapeless_output_flat.onnx", setup);
+    replace_program(dir, "rows_reshaped.onnx", setup);
     const auto before = std::filesystem::last_write_time(programIn(dir));
     auto trt = makeAt(dir, dir / "model.onnx");
     ASSERT_TRUE(setup(*trt));
@@ -1238,51 +1248,6 @@ TEST_F(MigraphxCommonTest, CachedProgramWithOtherOutputDimsIsRebuilt)
   }
 }
 
-namespace
-{
-/// The sum of the first `count` elements of the test input.
-double inputSum(const std::size_t count)
-{
-  double sum = 0.0;
-  for (std::size_t i = 0; i < count; ++i) {
-    sum += inputValue(i);
-  }
-  return sum;
-}
-}  // namespace
-
-TEST_F(MigraphxCommonTest, ScalarOutputHasRankZeroWithOrWithoutAShapeInTheModel)
-{
-  // The scalar_sum models: y = the sum of x [rows, 4] or [3, 4], a scalar, which the model
-  // declares as one or gives no shape. As with TensorRT, y has rank 0 before and after setup(), a
-  // NetworkIO giving it rank 0 is accepted, and a run writes its one element.
-  const auto check = [this](const std::string & name) {
-    SCOPED_TRACE(name);
-    const auto is_static = name.find("static") != std::string::npos;
-    auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
-      (kDataDir / (name + ".onnx")).string(), "fp32", enginePath(name), 1ULL << 26U));
-    expectDims(trt->getOutputDims(0), {});
-    expectDims(trt->getTensorShape(1), {});
-    ASSERT_TRUE(trt->setup(
-      is_static ? nullptr : rowsProfile(),
-      std::make_unique<std::vector<NetworkIO>>(std::vector<NetworkIO>{
-        NetworkIO("x", {2, {is_static ? 3 : -1, 4}}), NetworkIO("y", {0, {}})})));
-    expectDims(trt->getOutputDims(0), {});
-    expectDims(trt->getTensorShape(1), {});
-    expectDims(trt->getTensorShape("y"), {});
-    for (const int64_t rows :
-         is_static ? std::vector<int64_t>{3} : std::vector<int64_t>{64, 8, 3}) {
-      const auto y = runRows(*trt, rows, {});
-      ASSERT_EQ(y.size(), 1U);
-      EXPECT_NEAR(y[0], inputSum(rows * 4), 1e-4) << "rows " << rows;
-    }
-  };
-  for (const auto * name :
-       {"scalar_sum", "scalar_sum_shapeless", "scalar_sum_static", "scalar_sum_shapeless_static"}) {
-    check(name);
-  }
-}
-
 TEST_F(MigraphxCommonTest, ScalarInputIsSetWithNoDimensions)
 {
   // scalar_scale.onnx: y = x * s for x [rows, 4] and a scalar s, which has rank 0.
@@ -1297,80 +1262,6 @@ TEST_F(MigraphxCommonTest, ScalarInputIsSetWithNoDimensions)
     for (std::size_t i = 0; i < y.size(); ++i) {
       EXPECT_FLOAT_EQ(y[i], inputValue(i) * 2.5F) << "rows " << rows << ", element " << i;
     }
-  }
-}
-
-TEST_F(MigraphxCommonTest, OneElementOutputIsNotTakenForAScalar)
-{
-  // row_sums.onnx: y = the row sums of x [rows, 4], which the model gives no shape. Read with one
-  // row, as when the model is constructed, MIGraphX gives y one element in one dimension, as it
-  // gives a scalar. Its rank follows from the model, so y is reported as [-1], and a buffer sized
-  // from that, -1 taken as the number of rows, holds what a run writes; sized for a scalar, the
-  // buffer would hold one element.
-  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
-    (kDataDir / "row_sums.onnx").string(), "fp32", enginePath("row_sums"), 1ULL << 26U));
-  expectDims(trt->getOutputDims(0), {-1});
-  ASSERT_TRUE(trt->setup(rowsProfile(), nullptr));
-  expectDims(trt->getOutputDims(0), {-1});
-  expectDims(trt->getTensorShape("y"), {-1});
-  for (const int64_t rows : std::vector<int64_t>{64, 8, 1}) {
-    const auto y = runRows(*trt, rows, {rows});
-    ASSERT_EQ(y.size(), static_cast<std::size_t>(rows));
-    for (int64_t r = 0; r < rows; ++r) {
-      float sum = 0.0F;
-      for (int64_t c = 0; c < 4; ++c) {
-        sum += inputValue(r * 4 + c);
-      }
-      EXPECT_NEAR(y[r], sum, 1e-5) << "rows " << rows << ", row " << r;
-    }
-  }
-}
-
-TEST_F(MigraphxCommonTest, OutputThatMayBeAScalarIsRefusedWhenItsRankIsNotKnown)
-{
-  // The untold_rank models: y = Einsum("ij->i", x), which the model gives no shape and whose rank
-  // is not inferred from an Einsum. With x [rows, 4], MIGraphX gives y more than one element when
-  // rows is not 1, so y is not a scalar, and its rank is reported. With x [1, 4], y has one
-  // element at the only input shape there is, as a scalar would: the model is refused.
-  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
-    (kDataDir / "untold_rank_rows.onnx").string(), "fp32", enginePath("untold_rank_rows"),
-    1ULL << 26U));
-  expectDims(trt->getOutputDims(0), {-1});
-  ASSERT_TRUE(trt->setup(rowsProfile(), nullptr));
-  const auto y = runRows(*trt, 8, {8});
-  ASSERT_EQ(y.size(), 8U);
-  for (int64_t r = 0; r < 8; ++r) {
-    EXPECT_NEAR(y[r], inputSum(r * 4 + 4) - inputSum(r * 4), 1e-5) << "row " << r;
-  }
-
-  EXPECT_THROW(
-    TrtCommon(TrtCommonConfig(
-      (kDataDir / "untold_rank.onnx").string(), "fp32", enginePath("untold_rank"), 1ULL << 26U)),
-    std::runtime_error);
-}
-
-TEST_F(MigraphxCommonTest, OutputRanksFollowTheModelsOperators)
-{
-  // output_ranks.onnx: outputs of x [2, 3, 4] that the model gives no shape, covering each way the
-  // rank is inferred from the model; generate_conv_network.py checks these ranks against ONNX
-  // shape inference.
-  const std::map<std::string, int32_t> ranks{
-    {"relu", 3},         {"transposed", 3},     {"split_0", 3},
-    {"split_1", 3},      {"top_values", 3},     {"top_indices", 3},
-    {"sum", 3},          {"where", 3},          {"kept_sum", 3},
-    {"column_means", 2}, {"total", 0},          {"arg_max", 2},
-    {"squeezed", 2},     {"unsqueezed", 5},     {"reshaped", 2},
-    {"expanded", 4},     {"filled", 2},         {"flat", 2},
-    {"gemm", 2},         {"vector_product", 2}, {"batched_product", 3},
-    {"picked", 2},       {"gathered", 4},       {"shape", 1},
-    {"size", 0},         {"constant", 2},       {"nonzero", 2},
-    {"range", 1}};
-  TrtCommon trt(TrtCommonConfig(
-    (kDataDir / "output_ranks.onnx").string(), "fp32", enginePath("output_ranks"), 1ULL << 26U));
-  ASSERT_EQ(trt.getNbIOTensors(), static_cast<int32_t>(ranks.size()) + 1);
-  for (int32_t o = 0; o + 1 < trt.getNbIOTensors(); ++o) {
-    const std::string name = trt.getIOTensorName(o + 1);
-    EXPECT_EQ(trt.getOutputDims(o).nbDims, ranks.at(name)) << name;
   }
 }
 
