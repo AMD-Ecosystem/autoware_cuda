@@ -15,6 +15,7 @@
 #ifndef ONNX_MODEL_IO_HPP_
 #define ONNX_MODEL_IO_HPP_
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -32,8 +33,12 @@ struct OnnxTensor
   std::string name;
   //!< ONNX TensorProto.DataType value, 0 when the model does not say.
   int32_t elem_type{0};
-  //!< Dimensions, -1 for a symbolic or unknown one; empty when the model declares no shape.
+  //!< Dimensions, -1 for a symbolic or unknown one; empty for a scalar, nullopt when the model
+  //!< declares no shape.
   std::optional<std::vector<int64_t>> dims;
+  //!< For a graph output the model gives no shape: its rank as inferred from the graph's nodes,
+  //!< or nullopt when it cannot be.
+  std::optional<std::size_t> rank;
 };
 
 /**
@@ -50,7 +55,8 @@ struct OnnxModelIO
 /**
  * @brief Read the graph inputs and outputs of an ONNX model file.
  *
- * Only the graph's input, output and initializer names are decoded; weights and nodes are
+ * Besides the graph's inputs and outputs, only what infers the rank of an output with no shape is
+ * decoded: the nodes, and the names and dimensions of initializers and value_info. Weights are
  * skipped without being read into memory.
  *
  * @param[in] path ONNX model path.

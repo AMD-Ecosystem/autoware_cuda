@@ -30,6 +30,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -37,6 +38,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -208,11 +210,14 @@ protected:
   {
     SKIP_TEST_IF_CUDA_UNAVAILABLE();
 
-    work_dir_ = std::filesystem::temp_directory_path() /
-                ("autoware_tensorrt_common_migraphx_test_" +
-                 std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()));
-    std::filesystem::remove_all(work_dir_);
-    std::filesystem::create_directories(work_dir_);
+    // A directory of its own, so that test processes running at the same time do not share it.
+    auto pattern =
+      (std::filesystem::temp_directory_path() /
+       ("autoware_tensorrt_common_migraphx_test_" +
+        std::string(::testing::UnitTest::GetInstance()->current_test_info()->name()) + "_XXXXXX"))
+        .string();
+    ASSERT_NE(mkdtemp(pattern.data()), nullptr) << "cannot create " << pattern;
+    work_dir_ = pattern;
     ASSERT_HIP_SUCCESS(hipStreamCreate(&stream_));
 
     reference_ = readFloats(kDataDir / "conv_network_reference.bin");
@@ -298,6 +303,57 @@ protected:
       }
     }
     return files;
+  }
+
+  /// Run a model of x [rows, 4] and one output y at `rows` rows, with y in a buffer sized from
+  /// getOutputDims(0), each -1 taken as the length `known` gives for that dimension, and a guard
+  /// region after it, which a run must not write. Returns what the run wrote in the sized buffer.
+  std::vector<float> runRows(
+    TrtCommon & trt, const int64_t rows, const std::vector<int64_t> & known,
+    const std::vector<std::pair<std::string, float>> & scalars = {})
+  {
+    static constexpr std::size_t kGuard = 1024;
+    static constexpr float kSentinel = -12345.0F;
+    const auto reported = trt.getOutputDims(0);
+    std::size_t size = 1;
+    for (int32_t i = 0; i < reported.nbDims; ++i) {
+      size *= static_cast<std::size_t>(reported.d[i] < 0 ? known.at(i) : reported.d[i]);
+    }
+    std::vector<float> x(rows * 4);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      x[i] = inputValue(i);
+    }
+    DeviceBuffer x_d(x.size());
+    DeviceBuffer y_d(size + kGuard);
+    x_d.upload(x);
+    y_d.upload(std::vector<float>(size + kGuard, kSentinel));
+    EXPECT_TRUE(trt.setTensor("x", x_d.get(), {2, {rows, 4}}));
+    std::vector<std::unique_ptr<DeviceBuffer>> scalar_buffers;
+    for (const auto & [name, value] : scalars) {
+      auto & buffer = scalar_buffers.emplace_back(std::make_unique<DeviceBuffer>(1));
+      buffer->upload({value});
+      EXPECT_TRUE(trt.setTensor(name.c_str(), buffer->get(), {0, {}}));
+    }
+    EXPECT_TRUE(trt.setTensorAddress("y", y_d.get()));
+    EXPECT_TRUE(trt.enqueueV3(stream_)) << "rows " << rows;
+    EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+    auto y = y_d.download();
+    EXPECT_TRUE(
+      std::all_of(
+        y.begin() + static_cast<std::ptrdiff_t>(size), y.end(),
+        [](float v) { return v == kSentinel; }))
+      << "a run at " << rows << " rows wrote past a buffer sized from the reported shape";
+    y.resize(size);
+    return y;
+  }
+
+  /// Check `y` against the ReLU of the input x of `rows` rows.
+  static void expectRelu(const std::vector<float> & y, const int64_t rows)
+  {
+    ASSERT_EQ(y.size(), static_cast<std::size_t>(rows * 4)) << "rows " << rows;
+    for (std::size_t i = 0; i < y.size(); ++i) {
+      EXPECT_EQ(y[i], std::max(inputValue(i), 0.0F)) << "rows " << rows << ", element " << i;
+    }
   }
 
   /// Run the conv network on `batch` samples and return the largest error against the
@@ -1086,37 +1142,8 @@ TEST_F(MigraphxCommonTest, OutputWithNoShapeInTheModelHasItsRankAndIsNeverWritte
   expectDims(trt->getTensorShape(1), {-1, -1});
   expectDims(trt->getTensorShape("y"), {-1, -1});
 
-  static constexpr std::size_t kGuard = 1024;
-  static constexpr float kSentinel = -12345.0F;
   for (const int64_t rows : std::vector<int64_t>{64, 8, 3}) {
-    const std::vector<int64_t> known{rows, 4};
-    const auto reported = trt->getOutputDims(0);
-    std::size_t size = 1;
-    for (int32_t i = 0; i < reported.nbDims; ++i) {
-      size *= static_cast<std::size_t>(reported.d[i] < 0 ? known.at(i) : reported.d[i]);
-    }
-    std::vector<float> x(rows * 4);
-    for (std::size_t i = 0; i < x.size(); ++i) {
-      x[i] = inputValue(i);
-    }
-    DeviceBuffer x_d(x.size());
-    DeviceBuffer y_d(size + kGuard);
-    x_d.upload(x);
-    y_d.upload(std::vector<float>(size + kGuard, kSentinel));
-    EXPECT_TRUE(trt->setTensor("x", x_d.get(), {2, {rows, 4}}));
-    EXPECT_TRUE(trt->setTensorAddress("y", y_d.get()));
-    EXPECT_TRUE(trt->enqueueV3(stream_)) << "rows " << rows;
-    EXPECT_EQ(hipStreamSynchronize(stream_), hipSuccess);
-    const auto y = y_d.download();
-    EXPECT_TRUE(
-      std::all_of(
-        y.begin() + static_cast<std::ptrdiff_t>(size), y.end(),
-        [](float v) { return v == kSentinel; }))
-      << "a run at " << rows << " rows wrote past a buffer sized from the reported shape";
-    ASSERT_EQ(size, x.size()) << "rows " << rows;
-    for (std::size_t i = 0; i < x.size(); ++i) {
-      EXPECT_EQ(y[i], std::max(x[i], 0.0F)) << "rows " << rows << ", element " << i;
-    }
+    expectRelu(runRows(*trt, rows, {rows, 4}), rows);
   }
 }
 
@@ -1182,6 +1209,9 @@ TEST_F(MigraphxCommonTest, CachedProgramWithOtherOutputDimsIsRebuilt)
     ASSERT_TRUE(setup(*trt));
     EXPECT_GT(std::filesystem::last_write_time(programIn(dir)), before)
       << "a program with another output rank was run";
+    for (const int64_t rows : std::vector<int64_t>{64, 8, 3}) {
+      expectRelu(runRows(*trt, rows, {rows, 4}), rows);
+    }
   }
   // logits [batch, 2] against a program giving logits [batch, 3].
   {
@@ -1205,6 +1235,142 @@ TEST_F(MigraphxCommonTest, CachedProgramWithOtherOutputDimsIsRebuilt)
     EXPECT_GT(std::filesystem::last_write_time(programIn(dir)), before)
       << "a program with another output length was run";
     EXPECT_LT(runConv(*trt, 8), 1e-5F);
+  }
+}
+
+namespace
+{
+/// The sum of the first `count` elements of the test input.
+double inputSum(const std::size_t count)
+{
+  double sum = 0.0;
+  for (std::size_t i = 0; i < count; ++i) {
+    sum += inputValue(i);
+  }
+  return sum;
+}
+}  // namespace
+
+TEST_F(MigraphxCommonTest, ScalarOutputHasRankZeroWithOrWithoutAShapeInTheModel)
+{
+  // The scalar_sum models: y = the sum of x [rows, 4] or [3, 4], a scalar, which the model
+  // declares as one or gives no shape. As with TensorRT, y has rank 0 before and after setup(), a
+  // NetworkIO giving it rank 0 is accepted, and a run writes its one element.
+  const auto check = [this](const std::string & name) {
+    SCOPED_TRACE(name);
+    const auto is_static = name.find("static") != std::string::npos;
+    auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
+      (kDataDir / (name + ".onnx")).string(), "fp32", enginePath(name), 1ULL << 26U));
+    expectDims(trt->getOutputDims(0), {});
+    expectDims(trt->getTensorShape(1), {});
+    ASSERT_TRUE(trt->setup(
+      is_static ? nullptr : rowsProfile(),
+      std::make_unique<std::vector<NetworkIO>>(std::vector<NetworkIO>{
+        NetworkIO("x", {2, {is_static ? 3 : -1, 4}}), NetworkIO("y", {0, {}})})));
+    expectDims(trt->getOutputDims(0), {});
+    expectDims(trt->getTensorShape(1), {});
+    expectDims(trt->getTensorShape("y"), {});
+    for (const int64_t rows :
+         is_static ? std::vector<int64_t>{3} : std::vector<int64_t>{64, 8, 3}) {
+      const auto y = runRows(*trt, rows, {});
+      ASSERT_EQ(y.size(), 1U);
+      EXPECT_NEAR(y[0], inputSum(rows * 4), 1e-4) << "rows " << rows;
+    }
+  };
+  for (const auto * name :
+       {"scalar_sum", "scalar_sum_shapeless", "scalar_sum_static", "scalar_sum_shapeless_static"}) {
+    check(name);
+  }
+}
+
+TEST_F(MigraphxCommonTest, ScalarInputIsSetWithNoDimensions)
+{
+  // scalar_scale.onnx: y = x * s for x [rows, 4] and a scalar s, which has rank 0.
+  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
+    (kDataDir / "scalar_scale.onnx").string(), "fp32", enginePath("scalar_scale"), 1ULL << 26U));
+  expectDims(trt->getTensorShape(1), {});
+  ASSERT_TRUE(trt->setup(rowsProfile(), nullptr));
+  expectDims(trt->getTensorShape("s"), {});
+  for (const int64_t rows : std::vector<int64_t>{8, 3}) {
+    const auto y = runRows(*trt, rows, {rows, 4}, {{"s", 2.5F}});
+    ASSERT_EQ(y.size(), static_cast<std::size_t>(rows * 4));
+    for (std::size_t i = 0; i < y.size(); ++i) {
+      EXPECT_FLOAT_EQ(y[i], inputValue(i) * 2.5F) << "rows " << rows << ", element " << i;
+    }
+  }
+}
+
+TEST_F(MigraphxCommonTest, OneElementOutputIsNotTakenForAScalar)
+{
+  // row_sums.onnx: y = the row sums of x [rows, 4], which the model gives no shape. Read with one
+  // row, as when the model is constructed, MIGraphX gives y one element in one dimension, as it
+  // gives a scalar. Its rank follows from the model, so y is reported as [-1], and a buffer sized
+  // from that, -1 taken as the number of rows, holds what a run writes; sized for a scalar, the
+  // buffer would hold one element.
+  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
+    (kDataDir / "row_sums.onnx").string(), "fp32", enginePath("row_sums"), 1ULL << 26U));
+  expectDims(trt->getOutputDims(0), {-1});
+  ASSERT_TRUE(trt->setup(rowsProfile(), nullptr));
+  expectDims(trt->getOutputDims(0), {-1});
+  expectDims(trt->getTensorShape("y"), {-1});
+  for (const int64_t rows : std::vector<int64_t>{64, 8, 1}) {
+    const auto y = runRows(*trt, rows, {rows});
+    ASSERT_EQ(y.size(), static_cast<std::size_t>(rows));
+    for (int64_t r = 0; r < rows; ++r) {
+      float sum = 0.0F;
+      for (int64_t c = 0; c < 4; ++c) {
+        sum += inputValue(r * 4 + c);
+      }
+      EXPECT_NEAR(y[r], sum, 1e-5) << "rows " << rows << ", row " << r;
+    }
+  }
+}
+
+TEST_F(MigraphxCommonTest, OutputThatMayBeAScalarIsRefusedWhenItsRankIsNotKnown)
+{
+  // The untold_rank models: y = Einsum("ij->i", x), which the model gives no shape and whose rank
+  // is not inferred from an Einsum. With x [rows, 4], MIGraphX gives y more than one element when
+  // rows is not 1, so y is not a scalar, and its rank is reported. With x [1, 4], y has one
+  // element at the only input shape there is, as a scalar would: the model is refused.
+  auto trt = std::make_unique<TrtCommon>(TrtCommonConfig(
+    (kDataDir / "untold_rank_rows.onnx").string(), "fp32", enginePath("untold_rank_rows"),
+    1ULL << 26U));
+  expectDims(trt->getOutputDims(0), {-1});
+  ASSERT_TRUE(trt->setup(rowsProfile(), nullptr));
+  const auto y = runRows(*trt, 8, {8});
+  ASSERT_EQ(y.size(), 8U);
+  for (int64_t r = 0; r < 8; ++r) {
+    EXPECT_NEAR(y[r], inputSum(r * 4 + 4) - inputSum(r * 4), 1e-5) << "row " << r;
+  }
+
+  EXPECT_THROW(
+    TrtCommon(TrtCommonConfig(
+      (kDataDir / "untold_rank.onnx").string(), "fp32", enginePath("untold_rank"), 1ULL << 26U)),
+    std::runtime_error);
+}
+
+TEST_F(MigraphxCommonTest, OutputRanksFollowTheModelsOperators)
+{
+  // output_ranks.onnx: outputs of x [2, 3, 4] that the model gives no shape, covering each way the
+  // rank is inferred from the model; generate_conv_network.py checks these ranks against ONNX
+  // shape inference.
+  const std::map<std::string, int32_t> ranks{
+    {"relu", 3},         {"transposed", 3},     {"split_0", 3},
+    {"split_1", 3},      {"top_values", 3},     {"top_indices", 3},
+    {"sum", 3},          {"where", 3},          {"kept_sum", 3},
+    {"column_means", 2}, {"total", 0},          {"arg_max", 2},
+    {"squeezed", 2},     {"unsqueezed", 5},     {"reshaped", 2},
+    {"expanded", 4},     {"filled", 2},         {"flat", 2},
+    {"gemm", 2},         {"vector_product", 2}, {"batched_product", 3},
+    {"picked", 2},       {"gathered", 4},       {"shape", 1},
+    {"size", 0},         {"constant", 2},       {"nonzero", 2},
+    {"range", 1}};
+  TrtCommon trt(TrtCommonConfig(
+    (kDataDir / "output_ranks.onnx").string(), "fp32", enginePath("output_ranks"), 1ULL << 26U));
+  ASSERT_EQ(trt.getNbIOTensors(), static_cast<int32_t>(ranks.size()) + 1);
+  for (int32_t o = 0; o + 1 < trt.getNbIOTensors(); ++o) {
+    const std::string name = trt.getIOTensorName(o + 1);
+    EXPECT_EQ(trt.getOutputDims(o).nbDims, ranks.at(name)) << name;
   }
 }
 

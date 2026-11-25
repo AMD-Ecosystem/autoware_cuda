@@ -190,42 +190,57 @@ bool isStatic(const OnnxTensor & tensor)
          std::all_of(tensor.dims->begin(), tensor.dims->end(), [](auto d) { return d >= 0; });
 }
 
+/// Static output lengths of a parsed program, nullopt for an output that has none, or no entries
+/// when the program has another number of outputs than the model.
+std::vector<std::optional<Lens>> parsedOutputLens(
+  const OnnxModelIO & model, const migraphx::program & parsed)
+{
+  const auto shapes = parsed.get_output_shapes();
+  if (shapes.size() != model.outputs.size()) {
+    return {};
+  }
+  std::vector<std::optional<Lens>> lens;
+  for (std::size_t o = 0; o < shapes.size(); ++o) {
+    lens.push_back(shapes[o].dynamic() ? std::nullopt : std::optional<Lens>(shapes[o].lengths()));
+  }
+  return lens;
+}
+
 /**
- * Output dimensions as reported: as the model declares them, with what it leaves out taken from
- * `parsed`, the model as construction parsed it. With static inputs those are the only lengths
- * there are, and they fill in every dimension the model leaves symbolic. With a dynamic input
- * every such dimension is -1, including any that TensorRT would find to be constant, and an
- * output the model gives no shape takes the rank of the parsed one with every dimension -1. Such an
- * output stays nullopt only when the parse gives it no static shape, or gives another number of
- * outputs.
+ * Output dimensions as reported, nullopt for an output whose rank cannot be told. An output the
+ * model gives a shape keeps it, rank 0 for a scalar. Its symbolic dimensions are taken from
+ * `parsed`, the model as construction parsed it, when every input is static: those are then the
+ * only lengths there are. With a dynamic input every such dimension is -1, including any that
+ * TensorRT would find to be constant. An output the model gives no shape takes the rank inferred
+ * from the graph (`OnnxTensor::rank`), else the rank of the parsed output, with its dimensions
+ * found the same way. MIGraphX gives a scalar one element in one dimension, so a parsed output of
+ * one element does not tell its rank.
  */
 std::vector<std::optional<std::vector<int64_t>>> outputDims(
-  const OnnxModelIO & model, const migraphx::program & parsed, const bool has_dynamic_input)
+  const OnnxModelIO & model, const std::vector<std::optional<Lens>> & parsed,
+  const bool has_dynamic_input)
 {
   std::vector<std::optional<std::vector<int64_t>>> dims;
-  for (const auto & output : model.outputs) {
-    dims.push_back(output.dims);
-  }
-  const auto shapes = parsed.get_output_shapes();
-  if (shapes.size() != dims.size()) {
-    return dims;
-  }
-  for (std::size_t o = 0; o < dims.size(); ++o) {
-    if (shapes[o].dynamic()) {
+  for (std::size_t o = 0; o < model.outputs.size(); ++o) {
+    const auto & output = model.outputs[o];
+    const auto & lens = o < parsed.size() ? parsed[o] : std::nullopt;
+    auto rank = output.dims ? std::optional<std::size_t>(output.dims->size()) : output.rank;
+    if (!rank && lens && *lens != Lens{1}) {
+      rank = lens->size();
+    }
+    if (!rank) {
+      dims.emplace_back();
       continue;
     }
-    const auto lens = shapes[o].lengths();
-    auto & output = dims[o];
-    if (!output) {
-      output = has_dynamic_input ? std::vector<int64_t>(lens.size(), -1)
-                                 : std::vector<int64_t>(lens.begin(), lens.end());
-    } else if (!has_dynamic_input && output->size() == lens.size()) {
-      for (std::size_t i = 0; i < lens.size(); ++i) {
-        if ((*output)[i] < 0) {
-          (*output)[i] = static_cast<int64_t>(lens[i]);
+    auto reported = output.dims.value_or(std::vector<int64_t>(*rank, -1));
+    if (!has_dynamic_input && lens && lens->size() == reported.size()) {
+      for (std::size_t i = 0; i < lens->size(); ++i) {
+        if (reported[i] < 0) {
+          reported[i] = static_cast<int64_t>((*lens)[i]);
         }
       }
     }
+    dims.emplace_back(std::move(reported));
   }
   return dims;
 }
@@ -427,7 +442,7 @@ struct TrtCommon::MigraphxState
   OnnxModelIO model;
   //!< Output dimensions as reported (`outputDims`). Every compiled program is checked against
   //!< them, rank included, so a buffer sized from a reported dimension is never written past.
-  std::vector<std::optional<std::vector<int64_t>>> output_dims;
+  std::vector<std::vector<int64_t>> output_dims;
   //!< Size and hash of the ONNX file, recorded with a cached program.
   std::string model_fingerprint;
   //!< Device architecture the programs are compiled for.
@@ -460,7 +475,7 @@ struct TrtCommon::MigraphxState
   {
     return index < numInputs() ? model.inputs.at(index) : model.outputs.at(index - numInputs());
   }
-  [[nodiscard]] const std::optional<std::vector<int64_t>> & reportedDims(const int32_t index) const
+  [[nodiscard]] std::optional<std::vector<int64_t>> reportedDims(const int32_t index) const
   {
     return index < numInputs() ? model.inputs.at(index).dims : output_dims.at(index - numInputs());
   }
@@ -549,6 +564,7 @@ bool TrtCommon::initialize()
   const auto has_dynamic_input = !std::all_of(model->inputs.begin(), model->inputs.end(), isStatic);
   std::optional<migraphx::program> parsed;
   std::string parse_error;
+  unsigned int parsed_length = 1U;
   for (std::size_t attempt = 0; !parsed && attempt <= kFallbackParseLengths.size(); ++attempt) {
     try {
       migraphx::onnx_options options;
@@ -560,6 +576,7 @@ bool TrtCommon::initialize()
           trt_config_->onnx_path.c_str(), attempt == 1 ? 1U : kFallbackParseLengths[attempt - 2],
           kFallbackParseLengths[attempt - 1]);
         options.set_default_dim_value(kFallbackParseLengths[attempt - 1]);
+        parsed_length = kFallbackParseLengths[attempt - 1];
       }
       parsed = migraphx::parse_onnx(trt_config_->onnx_path.c_str(), options);
     } catch (const std::exception & e) {
@@ -577,7 +594,45 @@ bool TrtCommon::initialize()
       parse_error.c_str());
     return false;
   }
-  auto output_dims = outputDims(*model, *parsed, has_dynamic_input);
+  const auto parsed_lens = parsedOutputLens(*model, *parsed);
+  auto output_dims = outputDims(*model, parsed_lens, has_dynamic_input);
+
+  // A scalar has one element at any input shapes, so an output with more elements at other
+  // lengths of the dynamic dimensions is not one.
+  const auto is_unknown = [](const auto & dims) { return !dims.has_value(); };
+  if (has_dynamic_input && std::any_of(output_dims.begin(), output_dims.end(), is_unknown)) {
+    try {
+      migraphx::onnx_options options;
+      options.set_default_dim_value(
+        parsed_length == kFallbackParseLengths.front() ? kFallbackParseLengths.back()
+                                                       : kFallbackParseLengths.front());
+      const auto other = outputDims(
+        *model,
+        parsedOutputLens(*model, migraphx::parse_onnx(trt_config_->onnx_path.c_str(), options)),
+        has_dynamic_input);
+      for (std::size_t o = 0; o < output_dims.size(); ++o) {
+        if (!output_dims[o]) {
+          output_dims[o] = other[o];
+        }
+      }
+    } catch (const std::exception &) {
+      // The rank stays unknown.
+    }
+  }
+  std::vector<std::vector<int64_t>> reported_dims;
+  for (std::size_t o = 0; o < output_dims.size(); ++o) {
+    if (!output_dims[o]) {
+      const auto one_element = o < parsed_lens.size() && parsed_lens[o] == Lens{1};
+      logger_->log(
+        nvinfer1::ILogger::Severity::kERROR,
+        "Cannot tell the rank of output %s: the model gives it no shape, its rank does not follow "
+        "from the graph, and MIGraphX gives it %s. Give the output its shape in the model",
+        model->outputs[o].name.c_str(),
+        one_element ? "one element, as it does a scalar" : "no static shape");
+      return false;
+    }
+    reported_dims.push_back(std::move(*output_dims[o]));
+  }
 
   if (isStronglyTyped()) {
     logger_->log(
@@ -592,7 +647,7 @@ bool TrtCommon::initialize()
 
   migraphx_ = std::make_unique<MigraphxState>();
   migraphx_->model = std::move(*model);
-  migraphx_->output_dims = std::move(output_dims);
+  migraphx_->output_dims = std::move(reported_dims);
   migraphx_->model_fingerprint = *fingerprint;
   migraphx_->arch = *arch;
   migraphx_->addresses.assign(migraphx_->numTensors(), nullptr);
@@ -703,13 +758,17 @@ struct ProgramBuilder
   }
 };
 
-/// Whether compiled lengths agree with the dimensions of a tensor, -1 for any length.
+/// Whether compiled lengths agree with the dimensions of a tensor, -1 for any length. MIGraphX
+/// gives a scalar one element in one dimension.
 bool matchesDims(const Lens & lens, const std::optional<std::vector<int64_t>> & expected)
 {
   if (!expected) {
     return true;
   }
   const auto & dims = *expected;
+  if (dims.empty()) {
+    return lens.empty() || lens == Lens{1};
+  }
   if (dims.size() != lens.size()) {
     return false;
   }
@@ -728,7 +787,7 @@ bool matchesDims(const Lens & lens, const std::optional<std::vector<int64_t>> & 
 /// @throw std::runtime_error If the program does not fit the model's inputs and outputs.
 std::shared_ptr<CompiledProgram> describeProgram(
   migraphx::program program, const OnnxModelIO & model,
-  const std::vector<std::optional<std::vector<int64_t>>> & output_dims,
+  const std::vector<std::vector<int64_t>> & output_dims,
   const std::vector<bool> & empty_outputs = {})
 {
   auto compiled = std::make_shared<CompiledProgram>();
@@ -748,7 +807,9 @@ std::shared_ptr<CompiledProgram> describeProgram(
       for (std::size_t i = 0; i < num_inputs; ++i) {
         if (model.inputs[i].name == parameter) {
           index = static_cast<int32_t>(i);
-          compiled->input_lens[i] = shape.lengths();
+          // A scalar input's shape is set with no dimensions.
+          const auto & dims = model.inputs[i].dims;
+          compiled->input_lens[i] = dims && dims->empty() ? Lens{} : shape.lengths();
         }
       }
     }
@@ -757,7 +818,7 @@ std::shared_ptr<CompiledProgram> describeProgram(
     }
     const auto is_input = index < static_cast<int32_t>(num_inputs);
     const auto & tensor = is_input ? model.inputs[index] : model.outputs[index - num_inputs];
-    const auto & expected = is_input ? tensor.dims : output_dims.at(index - num_inputs);
+    const auto expected = is_input ? tensor.dims : output_dims.at(index - num_inputs);
     if (!matchesDims(shape.lengths(), expected)) {
       throw std::runtime_error(
         "Compiled program has shape " + lensRepr(shape.lengths()) + " for " +
@@ -831,17 +892,6 @@ bool TrtCommon::setup(ProfileDimsPtr profile_dims, NetworkIOPtr network_io)
           "MIGraphX cannot change the dtype of tensor '%s' to %s; it keeps the model's",
           io.tensor_name.c_str(), dtype_name(*io.dtype));
       }
-    }
-  }
-
-  // A program is checked against the reported rank of every output, so each needs one.
-  for (std::size_t o = 0; o < migraphx_->output_dims.size(); ++o) {
-    if (!migraphx_->output_dims[o]) {
-      logger_->log(
-        nvinfer1::ILogger::Severity::kERROR,
-        "The model gives output %s no shape, and MIGraphX gives it no rank either",
-        migraphx_->model.outputs[o].name.c_str());
-      return false;
     }
   }
 
@@ -973,9 +1023,8 @@ nvinfer1::Dims TrtCommon::getTensorShape(const char * tensor_name) const
   if (!index) {
     return nvinfer1::Dims{-1, {}};
   }
-  // Dynamic dimensions stay -1, as in a TensorRT engine. Every output has reported dimensions once
-  // setup() has succeeded; an input the model gives no shape is dynamic and takes the rank of the
-  // compiled program.
+  // Dynamic dimensions stay -1, as in a TensorRT engine. An input the model gives no shape is
+  // dynamic and takes the rank of the compiled program.
   if (const auto & dims = migraphx_->reportedDims(*index)) {
     return toDims(*dims);
   }
@@ -1036,7 +1085,7 @@ nvinfer1::Dims TrtCommon::getOutputDims(const int32_t index) const
     logger_->log(nvinfer1::ILogger::Severity::kERROR, "Invalid index for output tensor: %d", index);
     return {};
   }
-  return toDims(migraphx_->output_dims[index].value_or(std::vector<int64_t>{}));
+  return toDims(migraphx_->output_dims[index]);
 }
 
 bool TrtCommon::setTensorAddress(const char * tensor_name, void * data)

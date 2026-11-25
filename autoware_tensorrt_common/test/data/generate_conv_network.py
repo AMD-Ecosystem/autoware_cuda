@@ -4,10 +4,14 @@
 conv_network.onnx is a small classifier with a dynamic batch: a 3x3 convolution, ReLU, global
 average pooling and a fully connected layer. It returns two outputs, `logits` and then `features`,
 so the order of the outputs is observable. Variants of it check that a cached program is rebuilt
-when the model changes (other weights, a renamed input, another input size or class count) and
-that output dimensions the model leaves symbolic are reported once known; pool_network.onnx has
-output dimensions that follow a dynamic one through a floor division, and shapeless_output.onnx,
-shapeless_output_flat.onnx and squeezed.onnx an output the model gives no shape. activations.onnx
+when the model changes (other weights, a renamed input, another input size) and that output
+dimensions the model leaves symbolic are reported once known; the program of the variant with
+three classes stands in for a foreign program cached under the key of conv_network.onnx.
+pool_network.onnx has output dimensions that follow a dynamic one through a floor division, and
+shapeless_output.onnx, shapeless_output_flat.onnx, squeezed.onnx, row_sums.onnx and the
+untold_rank models an output the model gives no shape, as does output_ranks.onnx for each way an
+output rank is inferred from the model. The scalar_sum models return a scalar,
+with and without a shape in the model, and scalar_scale.onnx takes one. activations.onnx
 and scaled_sigmoid.onnx check that operations can be kept out of fp16, rows_scaled.onnx and
 rows.onnx take inputs with no rows, and custom_op_network.onnx calls an operator that a plugin
 library registers. Each reference file holds the float32 outputs for the input the test builds (see
@@ -277,6 +281,154 @@ for name, nodes, initializers in (
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 9
     onnx.save(model, str(here.with_name(name)))
+
+# The sum of every element of x [rows, 4] or [3, 4], a scalar, which the model declares as one
+# or gives no shape.
+for name, rows, y_dims in (
+    ("scalar_sum.onnx", ROWS, []),
+    ("scalar_sum_static.onnx", 3, []),
+    ("scalar_sum_shapeless.onnx", ROWS, None),
+    ("scalar_sum_shapeless_static.onnx", 3, None),
+):
+    graph = helper.make_graph(
+        [helper.make_node("ReduceSum", ["x"], ["y"], keepdims=0)],
+        "scalar_sum",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [rows, 4])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, y_dims)],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 9
+    if y_dims is None:
+        onnx.save(model, str(here.with_name(name)))
+    else:
+        save(model, name)
+
+# y = x * s for x [rows, 4] and a scalar s.
+graph = helper.make_graph(
+    [helper.make_node("Mul", ["x", "s"], ["y"])],
+    "scalar_scale",
+    [row_input, helper.make_tensor_value_info("s", TensorProto.FLOAT, [])],
+    [helper.make_tensor_value_info("y", TensorProto.FLOAT, [ROWS, 4])],
+)
+model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+model.ir_version = 9
+save(model, "scalar_scale.onnx")
+
+# Row sums of x [rows, 4], given no shape: [rows], which has one element when there is one row,
+# as a scalar does. Einsum "ij->i" computes the same, an operator whose output rank the backend
+# does not infer from the model, here also with x [1, 4].
+graph = helper.make_graph(
+    [helper.make_node("ReduceSum", ["x", "axes"], ["y"], keepdims=0)],
+    "row_sums",
+    [row_input],
+    [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
+    initializer=[numpy_helper.from_array(np.array([1], np.int64), "axes")],
+)
+model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+model.ir_version = 9
+onnx.save(model, str(here.with_name("row_sums.onnx")))
+for name, rows in (("untold_rank_rows.onnx", ROWS), ("untold_rank.onnx", 1)):
+    graph = helper.make_graph(
+        [helper.make_node("Einsum", ["x"], ["y"], equation="ij->i")],
+        "untold_rank",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [rows, 4])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 9
+    onnx.save(model, str(here.with_name(name)))
+
+# Outputs given no shape, one or two per rule by which the backend infers a rank from the model, of
+# x [2, 3, 4]. The ranks the test expects are those ONNX shape inference gives.
+RANKS = {
+    "relu": 3,
+    "transposed": 3,
+    "split_0": 3,
+    "split_1": 3,
+    "top_values": 3,
+    "top_indices": 3,
+    "sum": 3,
+    "where": 3,
+    "kept_sum": 3,
+    "column_means": 2,
+    "total": 0,
+    "arg_max": 2,
+    "squeezed": 2,
+    "unsqueezed": 5,
+    "reshaped": 2,
+    "expanded": 4,
+    "filled": 2,
+    "flat": 2,
+    "gemm": 2,
+    "vector_product": 2,
+    "batched_product": 3,
+    "picked": 2,
+    "gathered": 4,
+    "shape": 1,
+    "size": 0,
+    "constant": 2,
+    "nonzero": 2,
+    "range": 1,
+}
+tensor = numpy_helper.from_array
+rank_graph = helper.make_graph(
+    [
+        helper.make_node("Relu", ["x"], ["relu"]),
+        helper.make_node("Transpose", ["x"], ["transposed"], perm=[2, 0, 1]),
+        helper.make_node("Split", ["x"], ["split_0", "split_1"], axis=2),
+        helper.make_node("TopK", ["x", "k"], ["top_values", "top_indices"]),
+        helper.make_node("Add", ["x", "row"], ["sum"]),
+        helper.make_node("Where", ["mask", "x", "row"], ["where"]),
+        helper.make_node("ReduceSum", ["x", "axis_1"], ["kept_sum"]),
+        helper.make_node("ReduceMean", ["x"], ["column_means"], axes=[-1], keepdims=0),
+        helper.make_node("ReduceSum", ["x"], ["total"], keepdims=0),
+        helper.make_node("ArgMax", ["x"], ["arg_max"], keepdims=0),
+        helper.make_node("Squeeze", ["kept_sum", "axis_1"], ["squeezed"]),
+        helper.make_node("Unsqueeze", ["x", "axes_0_4"], ["unsqueezed"]),
+        helper.make_node("Reshape", ["x", "shape_6_4"], ["reshaped"]),
+        helper.make_node("Expand", ["x", "shape_1_2_3_4"], ["expanded"]),
+        helper.make_node("ConstantOfShape", ["shape_6_4"], ["filled"]),
+        helper.make_node("Flatten", ["x"], ["flat"]),
+        helper.make_node("Gemm", ["flat", "weight_12_5"], ["gemm"]),
+        helper.make_node("MatMul", ["row", "weight_4_5"], ["row_product"]),
+        helper.make_node("MatMul", ["x", "weight_4_5"], ["batched_product"]),
+        helper.make_node("Unsqueeze", ["row_product", "axes_0"], ["vector_product"]),
+        helper.make_node("Gather", ["x", "index"], ["picked"]),
+        helper.make_node("Gather", ["x", "indices_2_2"], ["gathered"]),
+        helper.make_node("Shape", ["x"], ["shape"]),
+        helper.make_node("Size", ["x"], ["size"]),
+        helper.make_node(
+            "Constant", [], ["constant"], value=tensor(np.zeros((2, 2), np.float32), "c")
+        ),
+        helper.make_node("NonZero", ["x"], ["nonzero"]),
+        helper.make_node("Range", ["start", "limit", "delta"], ["range"]),
+    ],
+    "ranks",
+    [helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 3, 4])],
+    [helper.make_tensor_value_info(name, TensorProto.UNDEFINED, None) for name in RANKS],
+    initializer=[
+        tensor(np.array([2], np.int64), "k"),
+        tensor(np.ones(4, np.float32), "row"),
+        tensor(np.ones(4, bool), "mask"),
+        tensor(np.array([1], np.int64), "axis_1"),
+        tensor(np.array([0, 4], np.int64), "axes_0_4"),
+        tensor(np.array([0], np.int64), "axes_0"),
+        tensor(np.array([6, 4], np.int64), "shape_6_4"),
+        tensor(np.array([1, 2, 3, 4], np.int64), "shape_1_2_3_4"),
+        tensor(np.ones((12, 5), np.float32), "weight_12_5"),
+        tensor(np.ones((4, 5), np.float32), "weight_4_5"),
+        tensor(np.array(1, np.int64), "index"),
+        tensor(np.zeros((2, 2), np.int64), "indices_2_2"),
+        tensor(np.array(0.0, np.float32), "start"),
+        tensor(np.array(3.0, np.float32), "limit"),
+        tensor(np.array(1.0, np.float32), "delta"),
+    ],
+)
+model = helper.make_model(rank_graph, opset_imports=[helper.make_opsetid("", 13)])
+model.ir_version = 9
+inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True).graph.output
+assert {o.name: len(o.type.tensor_type.shape.dim) for o in inferred} == RANKS
+onnx.save(model, str(here.with_name("output_ranks.onnx")))
 
 # y = AutowareTestFillSeven(x, buffer) + x = x + 7, where the test plugin library registers the
 # operator. As a MIGraphX custom operator that runs on the GPU must, it writes its result into
